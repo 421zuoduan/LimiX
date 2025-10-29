@@ -229,16 +229,32 @@ class MultiLabelLimiXInference:
         results_df.to_csv(output_path, index=False)
         print(f"\n详细结果已保存至 {output_path}")
         
-        # 保存均值结果
-        summary_df = summary.loc['mean'].to_frame().T
+        # 保存均值结果 - 修改为保存多个种子的指标平均值和标准差
+        # 创建包含平均值和标准差的DataFrame
+        summary_data = {}
+        for col in numeric_cols:
+            if col != 'seed':
+                # 保存平均值，列名格式为 "指标名_mean"
+                summary_data[f"{col}_mean"] = [summary.loc['mean', col]]
+                # 保存标准差，列名格式为 "指标名_std"
+                summary_data[f"{col}_std"] = [summary.loc['std', col]]
+        
         # 添加种子数量信息
-        summary_df['num_seeds'] = len(all_metrics)
-        # 重新排列列顺序，将num_seeds放在第一列
-        cols = ['num_seeds'] + [col for col in summary_df.columns if col != 'num_seeds']
+        summary_data['num_seeds'] = [len(all_metrics)]
+        
+        # 创建summary DataFrame
+        summary_df = pd.DataFrame(summary_data)
+        
+        # 重新排列列顺序，将num_seeds放在第一列，然后按指标分组
+        cols = ['num_seeds']
+        for col in numeric_cols:
+            if col != 'seed':
+                cols.extend([f"{col}_mean", f"{col}_std"])
         summary_df = summary_df[cols]
         
         summary_df.to_csv(summary_path, index=False)
         print(f"均值结果已保存至 {summary_path}")
+        print(f"注意：summary文件现在保存的是多个种子的指标平均值和标准差，而不是最高值")
 
 # 使用示例
 if __name__ == "__main__":
