@@ -6,6 +6,9 @@ from sklearn.preprocessing import label_binarize
 import torch
 from typing import Dict, List, Tuple
 import json
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from inference.predictor import LimiXPredictor
 import warnings
 warnings.filterwarnings('ignore')
@@ -15,7 +18,7 @@ class MultiLabelLimiXInference:
     使用LimiX进行多标签预测的完整分析流程
     """
     
-    def __init__(self, model_path: str, config_path: str = "config/cls_default_retrieval.json"):
+    def __init__(self, model_path: str, config_path: str = "config/cls_default_noretrieval.json"):
         """
         初始化多标签推理器
         

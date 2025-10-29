@@ -18,7 +18,7 @@ class SingleLabelLimiXInference:
     使用LimiX进行单标签预测的完整分析流程
     """
     
-    def __init__(self, model_path: str, config_path: str = "config/cls_default_retrieval.json"):
+    def __init__(self, model_path: str, config_path: str = "config/cls_default_noretrieval.json"):
         """
         初始化单标签推理器
         

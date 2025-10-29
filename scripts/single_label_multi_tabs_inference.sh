@@ -71,7 +71,7 @@ for config in "$TABLE_CONFIG_1" "$TABLE_CONFIG_2" "$TABLE_CONFIG_3"; do
     echo "=========================================="
     
     # 执行预测
-    python inference_med/single_label_multi_tabs_inference.py \
+    RANK=0 WORLD_SIZE=1 MASTER_ADDR=localhost MASTER_PORT=12355 python inference_med/single_label_multi_tabs_inference.py \
         --model_path "$MODEL_PATH" \
         --seeds $SEEDS
     
