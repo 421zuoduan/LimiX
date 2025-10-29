@@ -31,6 +31,12 @@
     --output_dir results/lora/my_experiment
   ```
 - **与推理对齐**：LoRA 训练和 inference_med 共享 `Element-wise` 与 `Subset/Samples` 两套指标，可直接比对微调增益。
+- **调参建议**：
+  - **训练配置**：增大 `--num_epochs`（建议 ≥5），尝试更大的 `--batch_size` 或梯度累积，调节学习率（1e-4 ↔︎ 5e-4 / 5e-5）并考虑 warmup/余弦退火。
+  - **LoRA 结构**：探索更高 `rank`、`alpha` 或增加 `target_layers`（例如 [8, 9, 10, 11]），必要时仅对注意力/MLP 子层挂 LoRA。
+  - **损失与样本**：对极度不平衡标签设置 `BCEWithLogitsLoss(pos_weight)`，或在 DataLoader 中上采样正例。
+  - **推理配置**：测试 `cls_default_retrieval.json`、`softmax_temperature`、阈值校准等，使推理阶段更贴近 LoRA 训练。
+  - **稳定性**：多随机种子取 `mean±std`；如需更稳健评估可改 K-fold 或增加验证集比例。
 
 ## 指标解读
 - **Element-wise（标签视角）**：对每个标签独立计算 Precision/Recall/F1/ROC-AUC/AP，再取宏平均；`accuracy` 表示逐标签命中率。
