@@ -107,6 +107,7 @@ class LoRATrainer:
             lr=learning_rate,
             weight_decay=1e-4
         )
+        self.test_ratio = 0.2  # portion of each mini-batch reserved as pseudo test samples
         
         # Loss function
         self.criterion = nn.BCEWithLogitsLoss()
@@ -194,18 +195,12 @@ class LoRATrainer:
         self.model.train()
         total_loss = 0.0
         
-        # Use mixed precision training
-        scaler = torch.cuda.amp.GradScaler('cuda')
-        
         for batch_idx, (X_batch, y_batch) in enumerate(train_loader):
             X_batch = X_batch.to(self.device)
             y_batch = y_batch.to(self.device)
             
             # Forward pass
             self.optimizer.zero_grad()
-            
-            # Reset scaler for each batch
-            scaler = torch.cuda.amp.GradScaler('cuda')
             
             # Prepare data for LimiX model
             # LimiX expects x: [batch, seq, feature] and y: [batch, label]
@@ -228,13 +223,20 @@ class LoRATrainer:
                 X_seq = X_batch.unsqueeze(0)  # [1, batch, features]
                 y_for_model = y_single.squeeze(-1).unsqueeze(0)  # [1, batch]
                 
+                # Split batch into pseudo train/test segments so the transformer receives both
+                eval_pos = max(1, int((1 - self.test_ratio) * X_seq.shape[1]))
+                eval_pos = min(eval_pos, X_seq.shape[1] - 1)
+                test_len = X_seq.shape[1] - eval_pos
+                if test_len <= 0:
+                    continue
+                
                 try:
                     # Forward pass through model with mixed precision
                     with torch.cuda.amp.autocast():
                         output = self.model(
                             x=X_seq,
                             y=y_for_model,
-                            eval_pos=1,
+                            eval_pos=eval_pos,
                             task_type='cls'
                         )
                     
@@ -256,52 +258,33 @@ class LoRATrainer:
                     
                     # Calculate loss
                     if cls_output.dim() > 2:
-                        cls_output = cls_output.squeeze()
+                        cls_output = cls_output.squeeze(0)
                     
-                    # Ensure shapes match - remove the sequence dimension
-                    if cls_output.dim() > 1:
-                        cls_output = cls_output.squeeze(0)  # [batch, num_classes]
+                    # Retain only the logits for the pseudo test portion
+                    cls_output = cls_output[:test_len]
+                    y_target = y_for_model[:, eval_pos:eval_pos + test_len].squeeze(0)
                     
-                    # Get the target labels
-                    y_target = y_for_model.squeeze(0)  # [batch]
+                    # Ensure shapes match
+                    min_len = min(cls_output.shape[0], y_target.shape[0])
+                    cls_output = cls_output[:min_len]
+                    y_target = y_target[:min_len]
                     
                     # Ensure target is float for BCEWithLogitsLoss
                     y_target = y_target.float()
                     
-                    # Check if we have the right number of samples
-                    if cls_output.shape[0] != y_target.shape[0]:
-                        print(f"Shape mismatch: cls_output.shape[0]={cls_output.shape[0]}, y_target.shape[0]={y_target.shape[0]}")
-                        # If shapes don't match, adjust cls_output to match target size
-                        if cls_output.shape[0] < y_target.shape[0]:
-                            # Pad cls_output if it's smaller
-                            padding_size = y_target.shape[0] - cls_output.shape[0]
-                            padding = torch.zeros(padding_size, cls_output.shape[1], device=cls_output.device)
-                            cls_output = torch.cat([cls_output, padding], dim=0)
-                        else:
-                            # Truncate cls_output if it's larger
-                            cls_output = cls_output[:y_target.shape[0]]
-                        
-                        # Also adjust y_target to match cls_output if needed
-                        if y_target.shape[0] != cls_output.shape[0]:
-                            y_target = y_target[:cls_output.shape[0]]
-                    
-                    # Ensure shapes match
-                    if cls_output.shape[-1] == 2:  # Binary classification
-                        # For binary classification, use the positive class logits
-                        # Convert to float for BCEWithLogitsLoss
-                        loss = self.criterion(cls_output[:, 1], y_target)
-                    elif cls_output.shape[-1] == 10:  # LimiX default 10-class output
-                        # For binary classification with 10-class output, use first two classes
-                        loss = self.criterion(cls_output[:, 1], y_target)
+                    # Collapse logits to the positive class for binary targets
+                    if cls_output.shape[-1] >= 2:
+                        logits = cls_output[:, 1].float()
                     else:
-                        # For multi-class, use the appropriate class
-                        loss = self.criterion(cls_output, y_target)
+                        logits = cls_output.squeeze(-1).float()
+                    
+                    loss = self.criterion(logits, y_target)
                     
                     # Scale loss by number of labels to maintain similar magnitude
                     scaled_loss = loss / n_labels
                     
-                    # Backward pass with mixed precision
-                    scaler.scale(scaled_loss).backward()
+                    # Backward pass
+                    scaled_loss.backward()
                     total_batch_loss += loss.item()
                     valid_forward_passes += 1
                     
@@ -311,13 +294,8 @@ class LoRATrainer:
             
             # Update weights with mixed precision - only if we had valid forward passes
             if valid_forward_passes > 0:
-                scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                scaler.step(self.optimizer)
-                scaler.update()  # Call update() to reset for next iteration
-            else:
-                # If no valid forward passes, just update scaler to avoid error
-                scaler.update()
+                self.optimizer.step()
             
             total_loss += total_batch_loss / n_labels
             
@@ -347,10 +325,10 @@ class LoRATrainer:
                 y_batch = y_batch.to(self.device)
                 
                 batch_size = X_batch.size(0)
-                n_features = X_batch.size(1)
                 n_labels = y_batch.size(1)
                 
                 batch_predictions = []
+                batch_targets = []
                 batch_loss = 0.0
                 
                 for label_idx in range(n_labels):
@@ -363,15 +341,18 @@ class LoRATrainer:
                     y_for_model = y_single.squeeze(-1).unsqueeze(0)  # [1, batch]
                     
                     try:
-                        # Forward pass with mixed precision
+                        eval_pos = max(1, min(int((1 - self.test_ratio) * X_seq.shape[1]), X_seq.shape[1] - 1))
                         with torch.cuda.amp.autocast():
                             output = self.model(
                                 x=X_seq,
                                 y=y_for_model,
-                                eval_pos=1,
+                                eval_pos=eval_pos,
                                 task_type='cls'
                             )
-                        
+                        test_len = X_seq.shape[1] - eval_pos
+                        if test_len <= 0:
+                            continue
+                            
                         # Extract classification output
                         if isinstance(output, dict):
                             cls_output = output.get('cls_output', output)
@@ -379,63 +360,48 @@ class LoRATrainer:
                             cls_output = output
                         
                         if cls_output.dim() > 2:
-                            cls_output = cls_output.squeeze()
+                            cls_output = cls_output.squeeze(0)
                         
-                        # Remove sequence dimension
-                        if cls_output.dim() > 1:
-                            cls_output = cls_output.squeeze(0)  # [batch, num_classes]
+                        cls_output = cls_output[:test_len]
                         
                         # Get the target labels
-                        y_target = y_for_model.squeeze(0)  # [batch]
+                        y_target = y_for_model[:, eval_pos:eval_pos + test_len].squeeze(0)  # [test_len]
                         
                         # Convert target to float for BCEWithLogitsLoss
-                        y_target = y_target.float()  # [batch]
+                        y_target = y_target.float()
                         
-                        # Check if we have the right number of samples
-                        if cls_output.shape[0] != y_target.shape[0]:
-                            print(f"Eval shape mismatch: cls_output.shape[0]={cls_output.shape[0]}, y_target.shape[0]={y_target.shape[0]}")
-                            # If shapes don't match, adjust cls_output to match target size
-                            if cls_output.shape[0] < y_target.shape[0]:
-                                # Pad cls_output if it's smaller
-                                padding_size = y_target.shape[0] - cls_output.shape[0]
-                                padding = torch.zeros(padding_size, cls_output.shape[1], device=cls_output.device)
-                                cls_output = torch.cat([cls_output, padding], dim=0)
-                            else:
-                                # Truncate cls_output if it's larger
-                                cls_output = cls_output[:y_target.shape[0]]
+                        min_len = min(cls_output.shape[0], y_target.shape[0])
+                        cls_output = cls_output[:min_len]
+                        y_target = y_target[:min_len]
                         
-                        # LimiX model outputs 10 classes by default, but we have binary targets
-                        if cls_output.shape[-1] == 10:  # LimiX default 10-class output
-                            # For binary classification, use only first two classes
-                            cls_output_binary = cls_output[:, :2]  # [batch, 2]
-                            loss = self.criterion(cls_output_binary[:, 1], y_target)
-                            # Get probability of positive class
-                            pred = torch.softmax(cls_output_binary, dim=1)[:, 1].cpu().numpy()
-                        elif cls_output.shape[-1] == 2:  # Binary classification
-                            loss = self.criterion(cls_output[:, 1], y_target)
-                            # Get probability of positive class
-                            pred = torch.softmax(cls_output, dim=1)[:, 1].cpu().numpy()
+                        if cls_output.shape[-1] >= 2:
+                            logits = cls_output[:, 1].float()
+                            pred = torch.softmax(cls_output[:, :2].float(), dim=1)[:, 1].detach().cpu().numpy()
                         else:
-                            # For multi-class, use appropriate class
-                            loss = self.criterion(cls_output, y_target)
-                            pred = torch.softmax(cls_output, dim=1)[:, 1].cpu().numpy()
+                            logits = cls_output.squeeze(-1).float()
+                            pred = torch.sigmoid(logits).detach().cpu().numpy()
                         
+                        loss = self.criterion(logits, y_target)
                         batch_loss += loss.item()
                         batch_predictions.append(pred)
+                        batch_targets.append(y_target.detach().cpu().numpy())
                         
                     except Exception as e:
                         print(f"Error in evaluation for label {label_idx}: {e}")
                         # Use dummy predictions
-                        batch_predictions.append(np.zeros(batch_size))
+                        batch_predictions.append(np.zeros(eval_pos if 'eval_pos' in locals() else batch_size))
+                        batch_targets.append(np.zeros(eval_pos if 'eval_pos' in locals() else batch_size))
                         continue
                 
                 total_loss += batch_loss / n_labels
                 
                 # Combine predictions for all labels
                 if batch_predictions:
-                    batch_preds = np.stack(batch_predictions, axis=1)
-                    all_predictions.append(batch_preds)
-                    all_targets.append(y_batch.cpu().numpy())
+                    min_pred_len = min(len(arr) for arr in batch_predictions)
+                    preds = np.stack([arr[:min_pred_len] for arr in batch_predictions], axis=1)
+                    targs = np.stack([arr[:min_pred_len] for arr in batch_targets], axis=1)
+                    all_predictions.append(preds)
+                    all_targets.append(targs)
         
         # Calculate metrics
         avg_loss = total_loss / len(val_loader)
