@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=3 RANK=0 WORLD_SIZE=1 MASTER_ADDR=localhost MASTER_PORT=12355 python inference_med/single_label_inference.py
