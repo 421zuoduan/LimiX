@@ -230,30 +230,50 @@ def run_lora_finetuning(
             if col != 'seed':
                 mean_val = summary.loc['mean', col]
                 std_val = summary.loc['std', col]
-                print(f"{col}: {mean_val:.4f} ± {std_val:.4f}")
+                mean_display = 0.0 if pd.isna(mean_val) else float(mean_val)
+                std_display = 0.0 if pd.isna(std_val) else float(std_val)
+                print(f"{col}: {mean_display:.4f}±{std_display:.4f}")
         
-        # 保存均值结果 - 修改为保存多个种子的指标平均值和标准差
-        # 创建包含平均值和标准差的DataFrame
-        summary_data = {}
-        for col in numeric_cols:
-            if col != 'seed':
-                # 保存平均值，列名格式为 "指标名_mean"
-                summary_data[f"{col}_mean"] = [summary.loc['mean', col]]
-                # 保存标准差，列名格式为 "指标名_std"
-                summary_data[f"{col}_std"] = [summary.loc['std', col]]
-        
-        # 添加种子数量信息
-        summary_data['num_seeds'] = [len(all_results)]
-        
-        # 创建summary DataFrame
-        summary_df = pd.DataFrame(summary_data)
-        
-        # 重新排列列顺序，将num_seeds放在第一列，然后按指标分组
-        cols = ['num_seeds']
-        for col in numeric_cols:
-            if col != 'seed':
-                cols.extend([f"{col}_mean", f"{col}_std"])
-        summary_df = summary_df[cols]
+        # 保存均值结果（mean±std），按 element-wise 与 subset 两行展示
+        variant_rows = []
+        variant_rows.append({'variant': 'elementwise'})
+        num_seeds = len(all_results)
+
+        def format_metric(col_name: str) -> str:
+            if col_name not in summary.columns:
+                return "-"
+            mean_val = summary.loc['mean', col_name]
+            std_val = summary.loc['std', col_name]
+            mean_display = 0.0 if pd.isna(mean_val) else float(mean_val)
+            std_display = 0.0 if pd.isna(std_val) else float(std_val)
+            return f"{mean_display:.4f}±{std_display:.4f}"
+
+        summary_rows = [
+            {
+                'group': 'Element-wise',
+                'num_seeds': num_seeds,
+                'accuracy': format_metric('lora_accuracy_elementwise'),
+                'precision': format_metric('lora_precision_macro_elementwise'),
+                'recall': format_metric('lora_recall_macro_elementwise'),
+                'f1': format_metric('lora_f1_macro_elementwise'),
+                'f1_micro': format_metric('lora_f1_micro_elementwise'),
+                'roc_auc': format_metric('lora_roc_auc_macro_elementwise'),
+                'avg_precision': format_metric('lora_avg_precision_macro_elementwise')
+            },
+            {
+                'group': 'Subset/Samples',
+                'num_seeds': num_seeds,
+                'accuracy': format_metric('lora_accuracy_subset'),
+                'precision': format_metric('lora_precision_samples_subset'),
+                'recall': format_metric('lora_recall_samples_subset'),
+                'f1': format_metric('lora_f1_samples_subset'),
+                'f1_micro': '-',
+                'roc_auc': format_metric('lora_roc_auc_samples_subset'),
+                'avg_precision': format_metric('lora_avg_precision_samples_subset')
+            }
+        ]
+
+        summary_df = pd.DataFrame(summary_rows)
         
         summary_df.to_csv(summary_path, index=False)
         print(f"均值结果已保存至 {summary_path}")

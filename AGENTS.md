@@ -228,6 +228,10 @@ torchrun --nproc_per_node=8 inference_classifier.py \
     --data_dir path_to_data
 ```
 
+## 自述文档
+
+- **快速查阅**：请参考 `README_MYSELF.md` 获取 inference_med 与 LoRA 微调的操作摘要、指标解读及推荐工作流。
+
 ## 技术支持
 
 - **技术报告**：[LimiX_Technical_Report.pdf](https://github.com/limix-ldm/LimiX/blob/main/LimiX_Technical_Report.pdf)

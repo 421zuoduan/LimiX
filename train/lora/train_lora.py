@@ -411,38 +411,83 @@ class LoRATrainer:
             all_targets = np.vstack(all_targets)
             
             # Convert predictions to binary
-            binary_predictions = (all_predictions > 0.5).astype(int)
+            binary_predictions = (all_predictions >= 0.5).astype(int)
             
-            # Calculate metrics consistent with multi_label_inference.py
-            try:
-                roc_auc = roc_auc_score(all_targets, all_predictions, average='macro')
-            except Exception as e:
-                print(f"ROC-AUC计算失败: {e}")
-                roc_auc = np.nan
-                
-            try:
-                avg_precision = average_precision_score(all_targets, all_predictions, average='macro')
-            except Exception as e:
-                print(f"Average Precision计算失败: {e}")
-                avg_precision = np.nan
-            
-            # Calculate metrics
+            # Calculate metrics for element-wise (per-label) and subset/sample perspectives
+            subset_accuracy = accuracy_score(all_targets, binary_predictions)
+            elementwise_accuracy = float((binary_predictions == all_targets).mean())
+
+            def safe_metric(func, *args, default=np.nan, **kwargs):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as err:
+                    print(f"{func.__name__}计算失败: {err}")
+                    return default
+
+            precision_macro = safe_metric(
+                precision_score, all_targets, binary_predictions, average='macro', zero_division=0
+            )
+            precision_samples = safe_metric(
+                precision_score, all_targets, binary_predictions, average='samples', zero_division=0
+            )
+            recall_macro = safe_metric(
+                recall_score, all_targets, binary_predictions, average='macro', zero_division=0
+            )
+            recall_samples = safe_metric(
+                recall_score, all_targets, binary_predictions, average='samples', zero_division=0
+            )
+            f1_macro = safe_metric(
+                f1_score, all_targets, binary_predictions, average='macro', zero_division=0
+            )
+            f1_micro = safe_metric(
+                f1_score, all_targets, binary_predictions, average='micro', zero_division=0
+            )
+            f1_samples = safe_metric(
+                f1_score, all_targets, binary_predictions, average='samples', zero_division=0
+            )
+            roc_auc_macro = safe_metric(
+                roc_auc_score, all_targets, all_predictions, average='macro'
+            )
+            roc_auc_samples = safe_metric(
+                roc_auc_score, all_targets, all_predictions, average='samples'
+            )
+            avg_precision_macro = safe_metric(
+                average_precision_score, all_targets, all_predictions, average='macro'
+            )
+            avg_precision_samples = safe_metric(
+                average_precision_score, all_targets, all_predictions, average='samples'
+            )
+
             metrics = {
-                'accuracy': accuracy_score(all_targets, binary_predictions),
-                'precision_macro': precision_score(all_targets, binary_predictions, average='macro', zero_division=0),
-                'recall_macro': recall_score(all_targets, binary_predictions, average='macro', zero_division=0),
-                'f1_macro': f1_score(all_targets, binary_predictions, average='macro', zero_division=0),
-                'f1_micro': f1_score(all_targets, binary_predictions, average='micro', zero_division=0),
-                'roc_auc': roc_auc,
-                'avg_precision': avg_precision
+                'accuracy_subset': subset_accuracy,
+                'accuracy_elementwise': elementwise_accuracy,
+                'precision_macro_elementwise': precision_macro,
+                'precision_samples_subset': precision_samples,
+                'recall_macro_elementwise': recall_macro,
+                'recall_samples_subset': recall_samples,
+                'f1_macro_elementwise': f1_macro,
+                'f1_micro_elementwise': f1_micro,
+                'f1_samples_subset': f1_samples,
+                'roc_auc_macro_elementwise': roc_auc_macro,
+                'roc_auc_samples_subset': roc_auc_samples,
+                'avg_precision_macro_elementwise': avg_precision_macro,
+                'avg_precision_samples_subset': avg_precision_samples
             }
         else:
             metrics = {
-                'accuracy': 0.0,
-                'precision_macro': 0.0,
-                'recall_macro': 0.0,
-                'f1_macro': 0.0,
-                'roc_auc_macro': 0.0
+                'accuracy_subset': 0.0,
+                'accuracy_elementwise': 0.0,
+                'precision_macro_elementwise': 0.0,
+                'precision_samples_subset': 0.0,
+                'recall_macro_elementwise': 0.0,
+                'recall_samples_subset': 0.0,
+                'f1_macro_elementwise': 0.0,
+                'f1_micro_elementwise': 0.0,
+                'f1_samples_subset': 0.0,
+                'roc_auc_macro_elementwise': 0.0,
+                'roc_auc_samples_subset': 0.0,
+                'avg_precision_macro_elementwise': 0.0,
+                'avg_precision_samples_subset': 0.0
             }
         
         return avg_loss, metrics
@@ -480,6 +525,10 @@ class LoRATrainer:
             
             print(f"Train Loss: {train_loss:.4f}")
             print(f"Val Loss: {val_loss:.4f}")
+            if 'accuracy_subset' in val_metrics:
+                print(f"Val Accuracy (subset): {val_metrics['accuracy_subset']:.4f}")
+            if 'accuracy_elementwise' in val_metrics:
+                print(f"Val Accuracy (element-wise): {val_metrics['accuracy_elementwise']:.4f}")
             print(f"Val Metrics: {val_metrics}")
             
             # Save best model
@@ -488,6 +537,11 @@ class LoRATrainer:
                 best_model_path = os.path.join(save_dir, 'best_lora_model.pth')
                 self.save_checkpoint(best_model_path, epoch, val_loss, val_metrics)
                 print(f"Saved best model to {best_model_path}")
+                
+                # Also save LoRA-only weights alongside the best checkpoint
+                lora_only_path = os.path.join(save_dir, 'best_lora_weights.pth')
+                self.save_lora_weights(lora_only_path)
+                print(f"Saved LoRA weights to {lora_only_path}")
             
             # Save regular checkpoint
             if (epoch + 1) % 5 == 0:
@@ -661,17 +715,20 @@ def main():
             if col != 'seed':
                 mean_val = summary.loc['mean', col]
                 std_val = summary.loc['std', col]
-                print(f"{col}: {mean_val:.4f} ± {std_val:.4f}")
+                mean_display = 0.0 if pd.isna(mean_val) else float(mean_val)
+                std_display = 0.0 if pd.isna(std_val) else float(std_val)
+                print(f"{col}: {mean_display:.4f}±{std_display:.4f}")
         
         # 保存均值结果 - 修改为保存多个种子的指标平均值和标准差
         # 创建包含平均值和标准差的DataFrame
         summary_data = {}
         for col in numeric_cols:
             if col != 'seed':
-                # 保存平均值，列名格式为 "指标名_mean"
-                summary_data[f"{col}_mean"] = [summary.loc['mean', col]]
-                # 保存标准差，列名格式为 "指标名_std"
-                summary_data[f"{col}_std"] = [summary.loc['std', col]]
+                mean_val = summary.loc['mean', col]
+                std_val = summary.loc['std', col]
+                mean_display = 0.0 if pd.isna(mean_val) else float(mean_val)
+                std_display = 0.0 if pd.isna(std_val) else float(std_val)
+                summary_data[col] = [f"{mean_display:.4f}±{std_display:.4f}"]
         
         # 添加种子数量信息
         summary_data['num_seeds'] = [len(all_results)]
@@ -680,10 +737,7 @@ def main():
         summary_df = pd.DataFrame(summary_data)
         
         # 重新排列列顺序，将num_seeds放在第一列，然后按指标分组
-        cols = ['num_seeds']
-        for col in numeric_cols:
-            if col != 'seed':
-                cols.extend([f"{col}_mean", f"{col}_std"])
+        cols = ['num_seeds'] + [col for col in numeric_cols if col != 'seed']
         summary_df = summary_df[cols]
         
         summary_df.to_csv(summary_path, index=False)
