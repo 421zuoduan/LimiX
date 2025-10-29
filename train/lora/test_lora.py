@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, average_precision_score
 from sklearn.preprocessing import LabelEncoder
 from typing import Dict, List, Tuple
 import warnings
@@ -272,6 +272,63 @@ def test_training_loop(model, X, y, target_cols):
         return False
 
 
+def test_multi_label_evaluation(model, X, y, target_cols):
+    """Test multi-label evaluation similar to multi_label_inference.py."""
+    print("Testing multi-label evaluation...")
+    
+    try:
+        from train_lora import LoRATrainer
+        from sklearn.model_selection import train_test_split
+        
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42
+        )
+        
+        # Create LoRA trainer for multi-label
+        lora_trainer = LoRATrainer(
+            model_path="/home/ruochen/models/limix/LimiX-16M.ckpt",
+            target_layers=[10, 11],  # Last two layers
+            rank=16,
+            alpha=32.0,
+            dropout=0.1,
+            learning_rate=1e-4,
+            batch_size=32,
+            num_epochs=2,  # Just 2 epochs for testing
+            device='cuda' if torch.cuda.is_available() else 'cpu'
+        )
+        
+        # Prepare data for LoRA training - use all targets together
+        lora_train_loader, lora_val_loader = lora_trainer.prepare_data(
+            X_train, y_train, test_size=0.2, random_state=42
+        )
+        
+        # Train LoRA model
+        lora_trainer.train(lora_train_loader, lora_val_loader, save_dir='./test_checkpoints')
+        
+        # Evaluate LoRA model
+        lora_val_loss, lora_metrics = lora_trainer.evaluate(lora_val_loader)
+        
+        print(f"Multi-label evaluation metrics: {lora_metrics}")
+        
+        # Check if metrics are consistent with multi_label_inference.py
+        required_metrics = ['accuracy', 'precision_macro', 'recall_macro', 'f1_macro', 'f1_micro', 'roc_auc', 'avg_precision']
+        missing_metrics = [m for m in required_metrics if m not in lora_metrics]
+        
+        if missing_metrics:
+            print(f"Missing metrics: {missing_metrics}")
+            return False
+        
+        print("Multi-label evaluation test passed!")
+        return True
+        
+    except Exception as e:
+        print(f"Error in multi-label evaluation test: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def main():
     """Main test function."""
     print("LoRA Fine-tuning Test Suite")
@@ -313,6 +370,12 @@ def main():
     print("\n5. Testing training loop...")
     if not test_training_loop(lora_model, X, y, target_cols):
         print("Training loop test failed!")
+        return False
+    
+    # Test 6: Multi-label evaluation
+    print("\n6. Testing multi-label evaluation...")
+    if not test_multi_label_evaluation(lora_model, X, y, target_cols):
+        print("Multi-label evaluation test failed!")
         return False
     
     print("\n" + "=" * 50)

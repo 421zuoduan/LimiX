@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, average_precision_score
 from sklearn.preprocessing import LabelEncoder
 from typing import Dict, List, Tuple
 import warnings
@@ -145,108 +145,57 @@ def run_lora_finetuning(
         seed_output_dir = os.path.join(output_dir, f'seed_{seed}')
         os.makedirs(seed_output_dir, exist_ok=True)
         
-        # Run LoRA fine-tuning for each target
-        seed_results = {'seed': seed}
+        # Run multi-label LoRA fine-tuning for all targets together
+        print(f"\n--- Training multi-label model for all targets ---")
         
-        for target_idx, target_col in enumerate(target_cols):
-            print(f"\n--- Training for target: {target_col} ({target_idx+1}/{len(target_cols)}) ---")
+        # Use all targets together for LoRA training
+        try:
+            # Import LoRA trainer
+            from train_lora import LoRATrainer
             
-            # Extract single target
-            y_train_single = y_train[:, target_idx:target_idx+1]
-            y_test_single = y_test[:, target_idx:target_idx+1]
-            
-            # Use existing LimiXPredictor for baseline
-            print("Running baseline inference...")
-            baseline_predictor = LimiXPredictor(
-                device='cuda' if torch.cuda.is_available() else 'cpu',
+            # Create LoRA trainer
+            lora_trainer = LoRATrainer(
                 model_path=model_path,
-                inference_config='config/cls_default_noretrieval.json',
-                task_type='Classification',
-                seed=seed
+                target_layers=[10, 11],  # Last two layers
+                rank=rank,
+                alpha=alpha,
+                dropout=dropout,
+                learning_rate=learning_rate,
+                batch_size=batch_size,
+                num_epochs=num_epochs,
+                device='cuda' if torch.cuda.is_available() else 'cpu'
             )
             
-            try:
-                # Get baseline predictions
-                baseline_pred = baseline_predictor.predict(X_train, y_train_single.squeeze(), X_test)
-                
-                # Calculate baseline metrics
-                if baseline_pred.shape[1] == 2:  # Binary classification
-                    baseline_pred_proba = baseline_pred[:, 1]
-                else:
-                    baseline_pred_proba = baseline_pred[:, 0]
-                
-                baseline_pred_binary = (baseline_pred_proba > 0.5).astype(int)
-                
-                baseline_metrics = {
-                    'accuracy': accuracy_score(y_test_single, baseline_pred_binary),
-                    'precision': precision_score(y_test_single, baseline_pred_binary, average='binary', zero_division=0),
-                    'recall': recall_score(y_test_single, baseline_pred_binary, average='binary', zero_division=0),
-                    'f1': f1_score(y_test_single, baseline_pred_binary, average='binary', zero_division=0),
-                    'roc_auc': roc_auc_score(y_test_single, baseline_pred_proba)
-                }
-                
-                print(f"Baseline metrics for {target_col}: {baseline_metrics}")
-                
-            except Exception as e:
-                print(f"Error in baseline inference: {e}")
-                baseline_metrics = {
-                    'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'roc_auc': 0.0
-                }
+            # Prepare data for LoRA training - use all targets together
+            lora_train_loader, lora_val_loader = lora_trainer.prepare_data(
+                X_train, y_train, test_size=0.2, random_state=seed
+            )
             
-            # LoRA fine-tuning
-            print("Running LoRA fine-tuning...")
-            try:
-                # Import LoRA trainer
-                from train_lora import LoRATrainer
-                
-                # Create LoRA trainer
-                lora_trainer = LoRATrainer(
-                    model_path=model_path,
-                    target_layers=[10, 11],  # Last two layers
-                    rank=rank,
-                    alpha=alpha,
-                    dropout=dropout,
-                    learning_rate=learning_rate,
-                    batch_size=batch_size,
-                    num_epochs=num_epochs,
-                    device='cuda' if torch.cuda.is_available() else 'cpu'
-                )
-                
-                # Prepare data for LoRA training - reshape single target to multi-label format
-                # LoRA trainer expects multi-label data, so we need to reshape
-                y_train_multi = np.zeros((y_train_single.shape[0], 1), dtype=np.float32)
-                y_train_multi[:, 0] = y_train_single.squeeze()
-                
-                lora_train_loader, lora_val_loader = lora_trainer.prepare_data(
-                    X_train, y_train_multi, test_size=0.2, random_state=seed
-                )
-                
-                # Train LoRA model
-                lora_trainer.train(lora_train_loader, lora_val_loader, save_dir=seed_output_dir)
-                
-                # Evaluate LoRA model
-                lora_val_loss, lora_metrics = lora_trainer.evaluate(lora_val_loader)
-                
-                print(f"LoRA metrics for {target_col}: {lora_metrics}")
-                
-                # Store LoRA results
-                for metric_name, metric_value in lora_metrics.items():
-                    seed_results[f'{target_col}_lora_{metric_name}'] = metric_value
-                
-            except Exception as e:
-                print(f"Error in LoRA fine-tuning: {e}")
-                # Use dummy LoRA metrics if training fails
-                lora_metrics = {
-                    'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'roc_auc': 0.0
-                }
-                
-                # Store LoRA results
-                for metric_name, metric_value in lora_metrics.items():
-                    seed_results[f'{target_col}_lora_{metric_name}'] = metric_value
+            # Train LoRA model
+            lora_trainer.train(lora_train_loader, lora_val_loader, save_dir=seed_output_dir)
             
-            # Store baseline results
-            for metric_name, metric_value in baseline_metrics.items():
-                seed_results[f'{target_col}_baseline_{metric_name}'] = metric_value
+            # Evaluate LoRA model
+            lora_val_loss, lora_metrics = lora_trainer.evaluate(lora_val_loader)
+            
+            print(f"Multi-label LoRA metrics: {lora_metrics}")
+            
+            # Store LoRA results
+            seed_results = {'seed': seed}
+            for metric_name, metric_value in lora_metrics.items():
+                seed_results[f'lora_{metric_name}'] = metric_value
+            
+        except Exception as e:
+            print(f"Error in multi-label LoRA fine-tuning: {e}")
+            # Use dummy LoRA metrics if training fails
+            lora_metrics = {
+                'accuracy': 0.0, 'precision_macro': 0.0, 'recall_macro': 0.0, 'f1_macro': 0.0,
+                'f1_micro': 0.0, 'roc_auc': 0.0, 'avg_precision': 0.0
+            }
+            
+            # Store LoRA results
+            seed_results = {'seed': seed}
+            for metric_name, metric_value in lora_metrics.items():
+                seed_results[f'lora_{metric_name}'] = metric_value
         
         # Save seed results
         seed_results_df = pd.DataFrame([seed_results])

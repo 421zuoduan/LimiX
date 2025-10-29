@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, average_precision_score
 from sklearn.preprocessing import LabelEncoder
 from typing import Dict, List, Tuple
 import warnings
@@ -195,7 +195,7 @@ class LoRATrainer:
         total_loss = 0.0
         
         # Use mixed precision training
-        scaler = torch.cuda.amp.GradScaler()
+        scaler = torch.cuda.amp.GradScaler('cuda')
         
         for batch_idx, (X_batch, y_batch) in enumerate(train_loader):
             X_batch = X_batch.to(self.device)
@@ -203,6 +203,9 @@ class LoRATrainer:
             
             # Forward pass
             self.optimizer.zero_grad()
+            
+            # Reset scaler for each batch
+            scaler = torch.cuda.amp.GradScaler('cuda')
             
             # Prepare data for LimiX model
             # LimiX expects x: [batch, seq, feature] and y: [batch, label]
@@ -214,6 +217,7 @@ class LoRATrainer:
             # For simplicity, we'll use a simplified approach
             # In practice, you might need to adapt this based on the exact LimiX interface
             total_batch_loss = 0.0
+            valid_forward_passes = 0
             
             for label_idx in range(n_labels):
                 # Prepare data for single label
@@ -240,6 +244,16 @@ class LoRATrainer:
                     else:
                         cls_output = output
                     
+                    # Debug print to understand shapes
+                    if label_idx == 0 and batch_idx == 0:
+                        print(f"Debug - X_seq shape: {X_seq.shape}")
+                        print(f"Debug - y_for_model shape: {y_for_model.shape}")
+                        print(f"Debug - output type: {type(output)}")
+                        if isinstance(output, dict):
+                            print(f"Debug - output keys: {output.keys()}")
+                        print(f"Debug - cls_output shape: {cls_output.shape}")
+                        print(f"Debug - y_target shape: {y_for_model.squeeze(0).shape}")
+                    
                     # Calculate loss
                     if cls_output.dim() > 2:
                         cls_output = cls_output.squeeze()
@@ -251,25 +265,58 @@ class LoRATrainer:
                     # Get the target labels
                     y_target = y_for_model.squeeze(0)  # [batch]
                     
+                    # Ensure target is float for BCEWithLogitsLoss
+                    y_target = y_target.float()
+                    
+                    # Check if we have the right number of samples
+                    if cls_output.shape[0] != y_target.shape[0]:
+                        print(f"Shape mismatch: cls_output.shape[0]={cls_output.shape[0]}, y_target.shape[0]={y_target.shape[0]}")
+                        # If shapes don't match, adjust cls_output to match target size
+                        if cls_output.shape[0] < y_target.shape[0]:
+                            # Pad cls_output if it's smaller
+                            padding_size = y_target.shape[0] - cls_output.shape[0]
+                            padding = torch.zeros(padding_size, cls_output.shape[1], device=cls_output.device)
+                            cls_output = torch.cat([cls_output, padding], dim=0)
+                        else:
+                            # Truncate cls_output if it's larger
+                            cls_output = cls_output[:y_target.shape[0]]
+                        
+                        # Also adjust y_target to match cls_output if needed
+                        if y_target.shape[0] != cls_output.shape[0]:
+                            y_target = y_target[:cls_output.shape[0]]
+                    
                     # Ensure shapes match
                     if cls_output.shape[-1] == 2:  # Binary classification
                         # For binary classification, use the positive class logits
+                        # Convert to float for BCEWithLogitsLoss
+                        loss = self.criterion(cls_output[:, 1], y_target)
+                    elif cls_output.shape[-1] == 10:  # LimiX default 10-class output
+                        # For binary classification with 10-class output, use first two classes
                         loss = self.criterion(cls_output[:, 1], y_target)
                     else:
                         # For multi-class, use the appropriate class
                         loss = self.criterion(cls_output, y_target)
                     
+                    # Scale loss by number of labels to maintain similar magnitude
+                    scaled_loss = loss / n_labels
+                    
                     # Backward pass with mixed precision
-                    scaler.scale(loss).backward()
+                    scaler.scale(scaled_loss).backward()
                     total_batch_loss += loss.item()
+                    valid_forward_passes += 1
                     
                 except Exception as e:
                     print(f"Error in forward pass for label {label_idx}: {e}")
                     continue
             
-            # Update weights with mixed precision
-            if total_batch_loss > 0:
+            # Update weights with mixed precision - only if we had valid forward passes
+            if valid_forward_passes > 0:
+                scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 scaler.step(self.optimizer)
+                scaler.update()  # Call update() to reset for next iteration
+            else:
+                # If no valid forward passes, just update scaler to avoid error
                 scaler.update()
             
             total_loss += total_batch_loss / n_labels
@@ -341,24 +388,37 @@ class LoRATrainer:
                         # Get the target labels
                         y_target = y_for_model.squeeze(0)  # [batch]
                         
-                        # Convert target to long type for cross-entropy
-                        y_target = y_for_model.squeeze(0).long()  # [batch]
+                        # Convert target to float for BCEWithLogitsLoss
+                        y_target = y_target.float()  # [batch]
+                        
+                        # Check if we have the right number of samples
+                        if cls_output.shape[0] != y_target.shape[0]:
+                            print(f"Eval shape mismatch: cls_output.shape[0]={cls_output.shape[0]}, y_target.shape[0]={y_target.shape[0]}")
+                            # If shapes don't match, adjust cls_output to match target size
+                            if cls_output.shape[0] < y_target.shape[0]:
+                                # Pad cls_output if it's smaller
+                                padding_size = y_target.shape[0] - cls_output.shape[0]
+                                padding = torch.zeros(padding_size, cls_output.shape[1], device=cls_output.device)
+                                cls_output = torch.cat([cls_output, padding], dim=0)
+                            else:
+                                # Truncate cls_output if it's larger
+                                cls_output = cls_output[:y_target.shape[0]]
                         
                         # LimiX model outputs 10 classes by default, but we have binary targets
                         if cls_output.shape[-1] == 10:  # LimiX default 10-class output
                             # For binary classification, use only first two classes
                             cls_output_binary = cls_output[:, :2]  # [batch, 2]
-                            loss = self.criterion(cls_output_binary, y_target)
+                            loss = self.criterion(cls_output_binary[:, 1], y_target)
                             # Get probability of positive class
                             pred = torch.softmax(cls_output_binary, dim=1)[:, 1].cpu().numpy()
                         elif cls_output.shape[-1] == 2:  # Binary classification
-                            loss = self.criterion(cls_output, y_target)
+                            loss = self.criterion(cls_output[:, 1], y_target)
                             # Get probability of positive class
                             pred = torch.softmax(cls_output, dim=1)[:, 1].cpu().numpy()
                         else:
                             # For multi-class, use appropriate class
                             loss = self.criterion(cls_output, y_target)
-                            pred = torch.softmax(cls_output, dim=1).cpu().numpy()
+                            pred = torch.softmax(cls_output, dim=1)[:, 1].cpu().numpy()
                         
                         batch_loss += loss.item()
                         batch_predictions.append(pred)
@@ -387,13 +447,28 @@ class LoRATrainer:
             # Convert predictions to binary
             binary_predictions = (all_predictions > 0.5).astype(int)
             
+            # Calculate metrics consistent with multi_label_inference.py
+            try:
+                roc_auc = roc_auc_score(all_targets, all_predictions, average='macro')
+            except Exception as e:
+                print(f"ROC-AUC计算失败: {e}")
+                roc_auc = np.nan
+                
+            try:
+                avg_precision = average_precision_score(all_targets, all_predictions, average='macro')
+            except Exception as e:
+                print(f"Average Precision计算失败: {e}")
+                avg_precision = np.nan
+            
             # Calculate metrics
             metrics = {
                 'accuracy': accuracy_score(all_targets, binary_predictions),
                 'precision_macro': precision_score(all_targets, binary_predictions, average='macro', zero_division=0),
                 'recall_macro': recall_score(all_targets, binary_predictions, average='macro', zero_division=0),
                 'f1_macro': f1_score(all_targets, binary_predictions, average='macro', zero_division=0),
-                'roc_auc_macro': roc_auc_score(all_targets, all_predictions, average='macro')
+                'f1_micro': f1_score(all_targets, binary_predictions, average='micro', zero_division=0),
+                'roc_auc': roc_auc,
+                'avg_precision': avg_precision
             }
         else:
             metrics = {

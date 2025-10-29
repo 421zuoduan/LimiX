@@ -181,7 +181,7 @@ class LoRAAdapter(nn.Module):
         
         return lora_forward(*args, **kwargs)
     
-    def merge_weights(self):
+    def merge_weights_to_model(self):
         """Merge LoRA weights with original weights."""
         for name, lora_layer in self.lora_layers.items():
             if name in self.original_weights:
@@ -195,10 +195,10 @@ class LoRAAdapter(nn.Module):
                 # Update target module's weights
                 for param_name, param in self.target_module.named_parameters():
                     if param_name == name:
-                        param.data = merged_weight
+                        param.data.copy_(merged_weight)
                         break
     
-    def unmerge_weights(self):
+    def unmerge_weights_from_model(self):
         """Restore original weights."""
         for name, original_weight in self.original_weights.items():
             for param_name, param in self.target_module.named_parameters():
@@ -321,12 +321,12 @@ class LoRAEnabledTransformer(nn.Module):
     def merge_lora_weights(self):
         """Merge all LoRA weights."""
         for adapter in self.lora_adapters.values():
-            adapter.merge_weights()
+            adapter.merge_weights_to_model()
     
     def unmerge_lora_weights(self):
         """Unmerge all LoRA weights."""
         for adapter in self.lora_adapters.values():
-            adapter.unmerge_weights()
+            adapter.unmerge_weights_from_model()
     
     def save_lora_weights(self, path: str):
         """Save all LoRA weights."""

@@ -13,3 +13,7 @@ result/
 .DS_store
 
 results/
+
+.spec-workflow
+
+test_checkpoints
