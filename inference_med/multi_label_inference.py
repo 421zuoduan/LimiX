@@ -256,7 +256,7 @@ class MultiLabelLimiXInference:
         results_df.to_csv(output_path, index=False)
         print(f"\n详细结果已保存至 {output_path}")
         
-        # 保存均值结果（mean±std），按 element-wise 与 subset 两行展示
+        # 保存均值结果（mean±std），按 Element-wise 与 Subset/Samples 两行展示
         num_seeds = len(all_metrics)
 
         def format_metric(col_name: str) -> str:
@@ -268,46 +268,32 @@ class MultiLabelLimiXInference:
             std_display = 0.0 if pd.isna(std_val) else float(std_val)
             return f"{mean_display:.4f}±{std_display:.4f}"
 
-        elementwise_row = {
-            'variant': 'elementwise',
-            'num_seeds': num_seeds,
-            'accuracy': format_metric('accuracy_elementwise'),
-            'precision_macro': format_metric('precision_macro_elementwise'),
-            'precision_samples': '-',
-            'recall_macro': format_metric('recall_macro_elementwise'),
-            'recall_samples': '-',
-            'f1_macro': format_metric('f1_macro_elementwise'),
-            'f1_micro': format_metric('f1_micro_elementwise'),
-            'f1_samples': '-',
-            'roc_auc_macro': format_metric('roc_auc_macro_elementwise'),
-            'roc_auc_samples': '-',
-            'avg_precision_macro': format_metric('avg_precision_macro_elementwise'),
-            'avg_precision_samples': '-'
-        }
-
-        subset_row = {
-            'variant': 'subset',
-            'num_seeds': num_seeds,
-            'accuracy': format_metric('accuracy_subset'),
-            'precision_macro': '-',
-            'precision_samples': format_metric('precision_samples_subset'),
-            'recall_macro': '-',
-            'recall_samples': format_metric('recall_samples_subset'),
-            'f1_macro': '-',
-            'f1_micro': '-',
-            'f1_samples': format_metric('f1_samples_subset'),
-            'roc_auc_macro': '-',
-            'roc_auc_samples': format_metric('roc_auc_samples_subset'),
-            'avg_precision_macro': '-',
-            'avg_precision_samples': format_metric('avg_precision_samples_subset')
-        }
-
-        summary_df = pd.DataFrame([elementwise_row, subset_row])
-        summary_df = summary_df[
-            ['variant', 'num_seeds', 'accuracy', 'precision_macro', 'precision_samples',
-             'recall_macro', 'recall_samples', 'f1_macro', 'f1_micro', 'f1_samples',
-             'roc_auc_macro', 'roc_auc_samples', 'avg_precision_macro', 'avg_precision_samples']
+        summary_rows = [
+            {
+                'group': 'Element-wise',
+                'num_seeds': num_seeds,
+                'accuracy': format_metric('accuracy_elementwise'),
+                'precision': format_metric('precision_macro_elementwise'),
+                'recall': format_metric('recall_macro_elementwise'),
+                'f1': format_metric('f1_macro_elementwise'),
+                'f1_micro': format_metric('f1_micro_elementwise'),
+                'roc_auc': format_metric('roc_auc_macro_elementwise'),
+                'avg_precision': format_metric('avg_precision_macro_elementwise')
+            },
+            {
+                'group': 'Subset/Samples',
+                'num_seeds': num_seeds,
+                'accuracy': format_metric('accuracy_subset'),
+                'precision': format_metric('precision_samples_subset'),
+                'recall': format_metric('recall_samples_subset'),
+                'f1': format_metric('f1_samples_subset'),
+                'f1_micro': '-',
+                'roc_auc': format_metric('roc_auc_samples_subset'),
+                'avg_precision': format_metric('avg_precision_samples_subset')
+            }
         ]
+
+        summary_df = pd.DataFrame(summary_rows)
         
         summary_df.to_csv(summary_path, index=False)
         print(f"均值结果已保存至 {summary_path}")
