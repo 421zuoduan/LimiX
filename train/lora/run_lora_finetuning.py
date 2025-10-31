@@ -154,11 +154,12 @@ def run_lora_finetuning(
             from train_lora import LoRATrainer
             
             # Create LoRA trainer
+            # alpha 自动设置为 rank 的两倍
             lora_trainer = LoRATrainer(
                 model_path=model_path,
                 target_layers=[10, 11],  # Last two layers
                 rank=rank,
-                alpha=alpha,
+                alpha=rank * 2,  # alpha 设置为 rank 的两倍
                 dropout=dropout,
                 learning_rate=learning_rate,
                 batch_size=batch_size,

@@ -58,10 +58,10 @@ class LoRATrainer:
         model_path: str,
         target_layers: List[int] = [10, 11],
         rank: int = 16,
-        alpha: float = 32.0,
+        alpha: float = None,  # 将自动设置为 rank 的两倍
         dropout: float = 0.1,
         learning_rate: float = 1e-4,
-        batch_size: int = 32,
+        batch_size: int = 64,  # 增大默认 batch size
         num_epochs: int = 10,
         device: str = 'cuda'
     ):
@@ -82,7 +82,8 @@ class LoRATrainer:
         self.model_path = model_path
         self.target_layers = target_layers
         self.rank = rank
-        self.alpha = alpha
+        # alpha 自动设置为 rank 的两倍
+        self.alpha = alpha if alpha is not None else rank * 2
         self.dropout = dropout
         self.learning_rate = learning_rate
         self.batch_size = batch_size

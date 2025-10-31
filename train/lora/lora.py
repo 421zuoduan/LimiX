@@ -16,7 +16,7 @@ class LoRALayer(nn.Module):
         in_features: int,
         out_features: int,
         rank: int = 16,
-        alpha: float = 32.0,
+        alpha: float = None,  # 将自动设置为 rank 的两倍
         dropout: float = 0.1,
         merge_weights: bool = True,
         device: Optional[torch.device] = None,
@@ -39,10 +39,11 @@ class LoRALayer(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.rank = rank
-        self.alpha = alpha
+        # alpha 自动设置为 rank 的两倍
+        self.alpha = alpha if alpha is not None else rank * 2
         self.dropout = dropout
         self.merge_weights = merge_weights
-        self.scaling = alpha / rank
+        self.scaling = self.alpha / rank
         
         # LoRA weights
         self.lora_A = nn.Parameter(
@@ -98,7 +99,7 @@ class LoRAAdapter(nn.Module):
         self,
         target_module: nn.Module,
         rank: int = 16,
-        alpha: float = 32.0,
+        alpha: float = None,  # 将自动设置为 rank 的两倍
         dropout: float = 0.1,
         target_names: list = ["weight"],
         merge_weights: bool = False
@@ -117,7 +118,8 @@ class LoRAAdapter(nn.Module):
         super().__init__()
         self.target_module = target_module
         self.rank = rank
-        self.alpha = alpha
+        # alpha 自动设置为 rank 的两倍
+        self.alpha = alpha if alpha is not None else rank * 2
         self.dropout = dropout
         self.target_names = target_names
         self.merge_weights = merge_weights
@@ -245,7 +247,7 @@ class LoRAEnabledTransformer(nn.Module):
         base_model: nn.Module,
         target_layers: list = None,
         rank: int = 16,
-        alpha: float = 32.0,
+        alpha: float = None,  # 将自动设置为 rank 的两倍
         dropout: float = 0.1
     ):
         """
@@ -262,7 +264,8 @@ class LoRAEnabledTransformer(nn.Module):
         self.base_model = base_model
         self.target_layers = target_layers or [10, 11]  # Last two layers by default
         self.rank = rank
-        self.alpha = alpha
+        # alpha 自动设置为 rank 的两倍
+        self.alpha = alpha if alpha is not None else rank * 2
         self.dropout = dropout
         
         # Apply LoRA to target layers

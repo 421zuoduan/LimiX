@@ -20,7 +20,7 @@ RANK=16
 ALPHA=32.0
 DROPOUT=0.1
 LEARNING_RATE=1e-4
-BATCH_SIZE=32
+BATCH_SIZE=64  # 增大默认 batch size
 NUM_EPOCHS=10
 DEVICE="cuda"
 
@@ -87,7 +87,7 @@ while [ $# -gt 0 ]; do
             echo "  --alpha FLOAT           LoRA缩放因子 (默认: $ALPHA)"
             echo "  --dropout FLOAT         Dropout概率 (默认: $DROPOUT)"
             echo "  --learning_rate FLOAT   学习率 (默认: $LEARNING_RATE)"
-            echo "  --batch_size INT       批次大小 (默认: $BATCH_SIZE)"
+            echo "  --batch_size INT       批次大小 (默认: $BATCH_SIZE，已增大以提高训练效率)"
             echo "  --num_epochs INT       训练轮数 (默认: $NUM_EPOCHS)"
             echo "  --device STR            设备 (默认: $DEVICE)"
             echo "  -h, --help             显示此帮助信息"
