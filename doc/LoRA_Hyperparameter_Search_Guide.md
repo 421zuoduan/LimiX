@@ -27,7 +27,7 @@
 - **dropout**: [0.0, 0.1, 0.2] - Dropout 概率
 - **learning_rate**: [1e-5, 5e-5, 1e-4] - 学习率
 - **batch_size**: [64] - 批次大小（已增大）
-- **num_epochs**: [20] - 训练轮数
+- **num_epochs**: [30] - 训练轮数（保存中间检查点）
 - **总组合数**: 36个组合（4 × 3 × 3 × 1 × 1），远小于100的限制
 
 ## 使用方法
@@ -91,24 +91,68 @@ python train/lora/lora_hyperparameter_search.py \
 ```
 output_dir/
 ├── combo_1/
-│   ├── seed_10/
-│   │   ├── best_lora_model.pth
-│   │   ├── best_lora_weights.pth
-│   │   └── results.csv
-│   └── seed_20/
-│       └── ...
+│   └── epoch_summary.csv             # 记录 10/20/30 epoch 的均值与标准差
 ├── combo_2/
-│   └── ...
+│   └── epoch_summary.csv
+├── global_best_models/                    # 全局最佳模型目录
+│   ├── {target_name}_best_weights.pth   # 当前最优LoRA权重（仅保留一份）
+│   └── {target_name}_best_metadata.json # 对应参数与指标
 └── {target_name}_hyperparameter_search_results.csv
 ```
 
+**注意**：过程中不会为每个种子/epoch 单独落盘 LoRA 权重，而是仅保留聚合指标与全局最佳的一份权重文件。
+
 ### 3. 最佳参数评估
 
-系统会自动基于以下指标评估最佳参数：
-- **Subset Accuracy**: 所有标签完全正确的样本比例
-- **Element-wise Accuracy**: 每个标签位置的正确率
-- **F1 Macro**: 宏平均 F1 分数
-- **ROC AUC**: ROC 曲线下面积
+#### 评估指标
+
+系统使用以下指标评估模型性能：
+
+- **主要评估指标**：
+  - `val_loss`: 验证损失（越小越好，作为主要选择标准）
+
+- **准确率指标**：
+  - `accuracy_subset`: 子集准确率（所有标签都预测正确才算正确）
+  - `accuracy_elementwise`: 元素级准确率（每个标签单独计算准确率）
+
+- **F1分数指标**：
+  - `f1_macro_elementwise`: 宏平均F1分数
+  - `f1_micro_elementwise`: 微平均F1分数
+  - `f1_samples_subset`: 样本级F1分数
+
+- **ROC AUC指标**：
+  - `roc_auc_macro_elementwise`: 宏平均ROC-AUC
+  - `roc_auc_samples_subset`: 样本级ROC-AUC
+
+- **平均精度指标**：
+  - `avg_precision_macro_elementwise`: 宏平均精度
+  - `avg_precision_samples_subset`: 样本级精度
+
+#### 最佳模型选择机制
+
+**单个参数组合内的最佳epoch选择**：
+1. 单次 30 epoch 训练，仅在第 10/20/30（以及最终 epoch）捕获指标与 LoRA 权重快照（保存在内存中）
+2. 聚合所有种子在这些 epoch 上的均值与标准差
+3. **基于验证损失（val_loss）选择最佳epoch**（越小越好）
+4. 当 val_loss 相近时，使用 accuracy_subset 作为次要标准
+5. 仅在该参数组合优于当前全局最佳时，才将对应 epoch 的 LoRA 权重写入 `global_best_models/`
+
+**全局最佳参数组合选择**：
+1. 比较各参数组合的最佳epoch性能
+2. **基于验证损失（val_loss）选择全局最佳参数组合**（越小越好）
+3. 当val_loss相近时，使用accuracy_subset作为次要标准
+4. 当发现更好的参数组合时，自动更新全局最佳模型
+5. 将最佳模型保存到统一目录 `output_dir/global_best_models/`
+
+#### 评估指标选择说明
+
+选择验证损失作为主要指标的原因：
+- **直接反映训练目标**：Val loss 直接反映模型在验证集上的预测误差
+- **稳定性**：相比准确率等指标，loss 通常更稳定，受阈值选择影响较小
+- **数值连续性**：Loss 是连续值，更适合进行精细的比较和优化
+- **避免过拟合检测**：Val loss 的上升通常表明过拟合
+
+次要指标（accuracy_subset）用于在val_loss相近时进行最终选择，确保模型具有良好的实际预测性能。
 
 ## 性能优化建议
 
@@ -129,6 +173,13 @@ output_dir/
 - **rank**: 控制模型容量，值越大表达能力越强
 - **alpha**: 自动设置为 rank 的两倍，保持 scaling = alpha/rank = 2 的恒定值
 - **dropout**: 防止过拟合，数据少时使用较高值
+
+### 4. 中间Epoch记录策略
+
+- **训练30个epoch**: 在第10、20、30（以及最终epoch）记录验证指标与LoRA权重快照（内存中保存）
+- **训练20个epoch**: 在第10、20（以及最终epoch）记录
+- **训练少于20个epoch**: 仅记录可用的目标epoch与最终结果
+- **优势**: 无需落盘多个模型文件即可比较不同epoch的性能，快速选出最优训练长度
 
 ## 故障排除
 
@@ -169,7 +220,7 @@ LimiX LoRA超参数搜索
 ================================================================================
 Testing parameter combination 1/2304
 ================================================================================
-Parameters: {'rank': 8, 'dropout': 0.0, 'learning_rate': 1e-05, 'batch_size': 64, 'num_epochs': 20}
+Parameters: {'rank': 8, 'dropout': 0.0, 'learning_rate': 1e-05, 'batch_size': 64, 'num_epochs': 30}
 
 --- Running with seed 10 ---
 Train set: (X, y)

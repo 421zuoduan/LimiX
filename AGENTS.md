@@ -232,6 +232,7 @@ torchrun --nproc_per_node=8 inference_classifier.py \
 
 - **快速查阅**：请参考 `README_MYSELF.md` 获取 inference_med 与 LoRA 微调的操作摘要、指标解读及推荐工作流。
 - **LoRA 调参提示**：README 中附带训练/结构/损失/推理多方面的微调建议（epoch、batch、rank、pos_weight、检索配置等），方便快速定位性能提升方向。
+- **LoRA 结果判定**：超参搜索统一训练 30 epoch，并比较第 10/20/30 epoch 的多种子均值表现；表现最佳的参数组合只保留一份 LoRA 权重，自动覆盖写入 `global_best_models/`。
 
 ## 技术支持
 

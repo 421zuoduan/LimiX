@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, average_precision_score
 from sklearn.preprocessing import LabelEncoder
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 import warnings
 import itertools
 from datetime import datetime
@@ -459,11 +459,13 @@ class LoRATrainer:
         return avg_loss, metrics
     
     def train(
-        self, 
-        train_loader: DataLoader, 
+        self,
+        train_loader: DataLoader,
         val_loader: DataLoader,
-        save_dir: str = './checkpoints'
-    ):
+        save_dir: str = None,
+        save_intermediate_epochs: List[int] = None,
+        capture_epochs: List[int] = None
+    ) -> Dict[int, Dict[str, Any]]:
         """
         Train the model.
         
@@ -471,10 +473,15 @@ class LoRATrainer:
             train_loader: Training data loader
             val_loader: Validation data loader
             save_dir: Directory to save checkpoints
+            save_intermediate_epochs: Epochs to persist checkpoints on disk
+            capture_epochs: Epochs to capture metrics/weights in memory
         """
-        os.makedirs(save_dir, exist_ok=True)
+        captured_snapshots: Dict[int, Dict[str, Any]] = {}
+        save_epochs = set(save_intermediate_epochs or [])
+        capture_epochs = set(capture_epochs or [])
         
-        best_val_loss = float('inf')
+        if save_dir and save_epochs:
+            os.makedirs(save_dir, exist_ok=True)
         
         for epoch in range(self.num_epochs):
             print(f"\nEpoch {epoch+1}/{self.num_epochs}")
@@ -496,17 +503,26 @@ class LoRATrainer:
             if 'accuracy_elementwise' in val_metrics:
                 print(f"Val Accuracy (element-wise): {val_metrics['accuracy_elementwise']:.4f}")
             
-            # Save best model
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_model_path = os.path.join(save_dir, 'best_lora_model.pth')
-                self.save_checkpoint(best_model_path, epoch, val_loss, val_metrics)
-                print(f"Saved best model to {best_model_path}")
+            current_epoch = epoch + 1
+            
+            # Capture snapshots for requested epochs
+            if current_epoch in capture_epochs:
+                captured_snapshots[current_epoch] = {
+                    'val_loss': float(val_loss),
+                    'val_metrics': val_metrics.copy(),
+                    'lora_state_dict': self.model.get_lora_state_dict()
+                }
+            
+            # Save intermediate checkpoints if required
+            if save_dir and current_epoch in save_epochs:
+                intermediate_model_path = os.path.join(save_dir, f'lora_model_epoch_{current_epoch}.pth')
+                intermediate_weights_path = os.path.join(save_dir, f'lora_weights_epoch_{current_epoch}.pth')
                 
-                # Also save LoRA-only weights alongside the best checkpoint
-                lora_only_path = os.path.join(save_dir, 'best_lora_weights.pth')
-                self.save_lora_weights(lora_only_path)
-                print(f"Saved LoRA weights to {lora_only_path}")
+                self.save_checkpoint(intermediate_model_path, epoch, val_loss, val_metrics)
+                self.save_lora_weights(intermediate_weights_path)
+                print(f"Saved intermediate checkpoint at epoch {current_epoch} to {intermediate_model_path}")
+        
+        return captured_snapshots
     
     def save_checkpoint(
         self, 
@@ -577,6 +593,177 @@ def load_and_preprocess_data(file_path: str, target_cols: List[str]) -> Tuple[np
     return X, y
 
 
+def aggregate_epoch_metrics(
+    metrics_by_epoch: Dict[int, List[Dict[str, float]]],
+    losses_by_epoch: Dict[int, List[float]]
+) -> Dict[int, Dict[str, float]]:
+    """
+    Aggregate metrics collected at specific epochs across seeds.
+    
+    Args:
+        metrics_by_epoch: Mapping from epoch -> list of metric dicts (per seed)
+        losses_by_epoch: Mapping from epoch -> list of validation losses (per seed)
+        
+    Returns:
+        Dictionary mapping epoch numbers to aggregated statistics (mean/std)
+    """
+    aggregated_results: Dict[int, Dict[str, float]] = {}
+    
+    for epoch, metrics_list in metrics_by_epoch.items():
+        if not metrics_list:
+            continue
+        
+        epoch_df = pd.DataFrame(metrics_list)
+        avg_metrics: Dict[str, float] = {}
+        
+        for col in epoch_df.columns:
+            avg_metrics[f'{col}_mean'] = float(epoch_df[col].mean())
+            avg_metrics[f'{col}_std'] = float(epoch_df[col].std())
+        
+        losses = losses_by_epoch.get(epoch, [])
+        if losses:
+            avg_metrics['val_loss_mean'] = float(np.mean(losses))
+            avg_metrics['val_loss_std'] = float(np.std(losses))
+        
+        avg_metrics['num_seeds'] = len(metrics_list)
+        aggregated_results[epoch] = avg_metrics
+    
+    return aggregated_results
+
+
+def select_best_epoch_for_combination(intermediate_results: Dict[int, Dict[str, float]], primary_metric: str = 'val_loss_mean') -> Tuple[int, Dict[str, float]]:
+    """
+    为参数组合选择最佳epoch
+    
+    Args:
+        intermediate_results: 字典，包含各epoch的平均指标
+        primary_metric: 主要评估指标名称（默认为val_loss，越小越好）
+        
+    Returns:
+        best_epoch: 最佳epoch编号
+        best_metrics: 最佳epoch的指标
+    """
+    best_epoch = None
+    best_score = float('inf')  # 对于loss，越小越好
+    best_metrics = None
+    
+    for epoch, metrics in intermediate_results.items():
+        # 使用val_loss作为主要评估指标（越小越好）
+        current_score = metrics.get(primary_metric, float('inf'))
+        
+        if current_score < best_score:
+            best_score = current_score
+            best_epoch = epoch
+            best_metrics = metrics
+    
+    return best_epoch, best_metrics
+
+
+def update_global_best_model(
+    current_best: Dict,
+    new_combination_metrics: Dict[str, float],
+    new_combination_params: Dict,
+    new_combination_weights: Dict[str, torch.Tensor],
+    primary_metric: str = 'val_loss_mean',
+    secondary_metric: str = 'accuracy_subset_mean'
+) -> Tuple[bool, Dict]:
+    """
+    更新全局最佳模型
+    
+    Args:
+        current_best: 当前最佳模型信息
+        new_combination_metrics: 新参数组合的最佳指标
+        new_combination_params: 新参数组合的参数
+        new_combination_weights: 新参数组合的LoRA权重（最佳epoch）
+        primary_metric: 主要评估指标名称（val_loss，越小越好）
+        secondary_metric: 次要评估指标名称（accuracy，越大越好）
+        
+    Returns:
+        should_update: 是否应该更新全局最佳模型
+        updated_best: 更新后的最佳模型信息
+    """
+    if current_best is None:
+        cloned_weights = {
+            key: value.clone() if torch.is_tensor(value) else value
+            for key, value in new_combination_weights.items()
+        }
+        return True, {
+            'metrics': dict(new_combination_metrics),
+            'params': dict(new_combination_params),
+            'weights': cloned_weights,
+            'combo_index': new_combination_params.get('combo_index')
+        }
+    
+    # 首先比较主要指标（val_loss，越小越好）
+    current_score = current_best['metrics'].get(primary_metric, float('inf'))
+    new_score = new_combination_metrics.get(primary_metric, float('inf'))
+    
+    if new_score < current_score:
+        cloned_weights = {
+            key: value.clone() if torch.is_tensor(value) else value
+            for key, value in new_combination_weights.items()
+        }
+        return True, {
+            'metrics': dict(new_combination_metrics),
+            'params': dict(new_combination_params),
+            'weights': cloned_weights,
+            'combo_index': new_combination_params.get('combo_index')
+        }
+    elif abs(new_score - current_score) < 1e-6:  # loss 相近时比较次要指标
+        # 如果主要指标相同，比较次要指标（accuracy，越大越好）
+        current_secondary = current_best['metrics'].get(secondary_metric, 0)
+        new_secondary = new_combination_metrics.get(secondary_metric, 0)
+        
+        if new_secondary > current_secondary:
+            cloned_weights = {
+                key: value.clone() if torch.is_tensor(value) else value
+                for key, value in new_combination_weights.items()
+            }
+            return True, {
+                'metrics': dict(new_combination_metrics),
+                'params': dict(new_combination_params),
+                'weights': cloned_weights,
+                'combo_index': new_combination_params.get('combo_index')
+            }
+    
+    return False, current_best
+
+
+def save_global_best_model(global_best_info: Dict, output_dir: str, target_cols: List[str]):
+    """
+    保存全局最佳模型到统一目录
+    
+    Args:
+        global_best_info: 全局最佳模型信息
+        output_dir: 输出目录
+        target_cols: 目标列名列表
+    """
+    # 创建全局最佳模型目录
+    global_best_dir = os.path.join(output_dir, 'global_best_models')
+    os.makedirs(global_best_dir, exist_ok=True)
+    
+    # 生成目标名称
+    target_name = "_".join(target_cols)
+    target_weights_path = os.path.join(global_best_dir, f'{target_name}_best_weights.pth')
+    metadata_path = os.path.join(global_best_dir, f'{target_name}_best_metadata.json')
+    
+    try:
+        torch.save(global_best_info['weights'], target_weights_path)
+        print(f"全局最佳LoRA权重已保存至: {target_weights_path}")
+        
+        metadata = {
+            'best_metrics': global_best_info['metrics'],
+            'best_params': global_best_info['params'],
+            'weights_path': target_weights_path,
+            'combo_index': global_best_info['combo_index']
+        }
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        print(f"全局最佳模型元数据已保存至: {metadata_path}")
+    except Exception as e:
+        print(f"保存全局最佳模型时出错: {e}")
+
+
 def run_hyperparameter_search(
     model_path: str,
     data_path: str,
@@ -607,6 +794,7 @@ def run_hyperparameter_search(
     
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
+    global_best_info = None
     
     # Load data
     X, y = load_and_preprocess_data(data_path, target_cols)
@@ -631,9 +819,26 @@ def run_hyperparameter_search(
         params = dict(zip(param_names, param_combo))
         print(f"Parameters: {params}")
         
-        # Run experiments for each seed with current parameters
-        seed_results = []
+        # Prepare directory to store aggregation summaries (lightweight)
+        combination_dir = os.path.join(output_dir, f'combo_{i+1}')
+        os.makedirs(combination_dir, exist_ok=True)
         
+        # Determine which epochs to evaluate for this parameter combination
+        num_epochs = params.get('num_epochs', 30)
+        candidate_epochs = [epoch for epoch in (10, 20, 30) if epoch <= num_epochs]
+        if num_epochs not in candidate_epochs:
+            candidate_epochs.append(num_epochs)
+        intermediate_epochs = sorted(set(candidate_epochs))
+        if not intermediate_epochs:
+            intermediate_epochs = [num_epochs]
+        
+        # Containers for metrics across seeds
+        metrics_by_epoch: Dict[int, List[Dict[str, float]]] = {epoch: [] for epoch in intermediate_epochs}
+        losses_by_epoch: Dict[int, List[float]] = {epoch: [] for epoch in intermediate_epochs}
+        epoch_best_states: Dict[int, Dict[str, torch.Tensor]] = {}
+        epoch_best_losses: Dict[int, float] = {}
+        
+        # Run experiments for each seed with current parameters
         for seed in seeds:
             print(f"\n--- Running with seed {seed} ---")
             
@@ -649,12 +854,6 @@ def run_hyperparameter_search(
             print(f"Train set: {X_train.shape}, {y_train.shape}")
             print(f"Test set: {X_test.shape}, {y_test.shape}")
             
-            # Create parameter-specific output directory
-            param_str = "_".join([f"{k}={v}" for k, v in params.items()])
-            param_str = param_str.replace("/", "_").replace(" ", "_")
-            seed_output_dir = os.path.join(output_dir, f'combo_{i+1}', f'seed_{seed}')
-            os.makedirs(seed_output_dir, exist_ok=True)
-            
             try:
                 # Create LoRA trainer with current parameters
                 # alpha 自动设置为 rank 的两倍
@@ -667,7 +866,7 @@ def run_hyperparameter_search(
                     dropout=params.get('dropout', 0.1),
                     learning_rate=params.get('learning_rate', 1e-4),
                     batch_size=params.get('batch_size', 64),  # 增大默认 batch size
-                    num_epochs=params.get('num_epochs', 10),
+                    num_epochs=params.get('num_epochs', 30),
                     device='cuda' if torch.cuda.is_available() else 'cpu'
                 )
                 
@@ -676,59 +875,121 @@ def run_hyperparameter_search(
                     X_train, y_train, test_size=0.2, random_state=seed
                 )
                 
-                # Train model
-                trainer.train(train_loader, val_loader, save_dir=seed_output_dir)
+                # Train model while capturing key epochs in memory
+                snapshots = trainer.train(
+                    train_loader,
+                    val_loader,
+                    save_dir=None,
+                    save_intermediate_epochs=None,
+                    capture_epochs=intermediate_epochs
+                )
                 
-                # Get final metrics
+                # Record final metrics for bookkeeping
                 if trainer.val_metrics:
                     final_metrics = trainer.val_metrics[-1]
                     final_metrics['seed'] = seed
-                    seed_results.append(final_metrics)
-                    
-                    # Save results
-                    results_df = pd.DataFrame([final_metrics])
-                    results_path = os.path.join(seed_output_dir, 'results.csv')
-                    results_df.to_csv(results_path, index=False)
-                    
                     print(f"Results for seed {seed}: {final_metrics}")
                 else:
                     print(f"No metrics available for seed {seed}")
+                
+                # Collect intermediate epoch metrics and best states
+                for epoch in intermediate_epochs:
+                    snapshot = snapshots.get(epoch)
+                    if snapshot is None:
+                        continue
+                    
+                    metrics_copy = snapshot['val_metrics'].copy()
+                    metrics_by_epoch[epoch].append(metrics_copy)
+                    losses_by_epoch[epoch].append(snapshot['val_loss'])
+                    
+                    best_loss = epoch_best_losses.get(epoch)
+                    if best_loss is None or snapshot['val_loss'] < best_loss:
+                        epoch_best_losses[epoch] = snapshot['val_loss']
+                        epoch_best_states[epoch] = snapshot['lora_state_dict']
                     
             except Exception as e:
                 print(f"Error in training with seed {seed}: {e}")
                 continue
         
-        # Calculate average metrics across seeds for this parameter combination
-        if seed_results:
-            # Convert to DataFrame for easier calculation
-            seed_results_df = pd.DataFrame(seed_results)
+        # Aggregate metrics across seeds for each monitored epoch
+        intermediate_results = aggregate_epoch_metrics(metrics_by_epoch, losses_by_epoch)
+        
+        if not intermediate_results:
+            print(f"\n⚠️  No intermediate results found for combination {i+1}. Skipping aggregation.")
+            continue
+        
+        best_epoch, best_epoch_metrics = select_best_epoch_for_combination(intermediate_results)
+        
+        if best_epoch is None or best_epoch_metrics is None:
+            print(f"\n⚠️  Unable to determine best epoch for combination {i+1}. Skipping aggregation.")
+            continue
+        
+        # Persist aggregated epoch metrics for analysis
+        try:
+            epoch_summary_path = os.path.join(combination_dir, 'epoch_summary.csv')
+            epoch_df = pd.DataFrame.from_dict(intermediate_results, orient='index')
+            epoch_df.index.name = 'epoch'
+            if 'epoch' in epoch_df.columns:
+                epoch_df = epoch_df.drop(columns=['epoch'])
+            epoch_df.reset_index(inplace=True)
+            epoch_df.to_csv(epoch_summary_path, index=False)
+        except Exception as e:
+            print(f"Warning: failed to save epoch summary for combination {i+1}: {e}")
+        
+        # Compose summary entry for this parameter combination
+        combination_summary = {
+            'combo_index': i + 1,
+            'best_epoch': best_epoch,
+            'num_seeds': best_epoch_metrics.get('num_seeds', len(seeds))
+        }
+        for param_name, param_value in params.items():
+            combination_summary[param_name] = param_value
+        metrics_for_summary = {k: v for k, v in best_epoch_metrics.items() if k != 'epoch'}
+        for metric_name, metric_value in metrics_for_summary.items():
+            combination_summary[metric_name] = metric_value
+        all_search_results.append(combination_summary)
+        
+        # Update global best model if this combination outperforms previous ones
+        best_epoch_weights = epoch_best_states.get(best_epoch)
+        if best_epoch_weights is not None:
+            global_best_updated, new_global_best_info = update_global_best_model(
+                global_best_info,
+                best_epoch_metrics,
+                {**params, 'combo_index': i + 1, 'best_epoch': best_epoch},
+                best_epoch_weights
+            )
             
-            # Calculate mean and std for each metric
-            avg_metrics = {}
-            for col in seed_results_df.columns:
-                if col != 'seed':
-                    avg_metrics[f'{col}_mean'] = seed_results_df[col].mean()
-                    avg_metrics[f'{col}_std'] = seed_results_df[col].std()
-            
-            # Add parameter information
-            for param_name, param_value in params.items():
-                avg_metrics[param_name] = param_value
-            
-            # Add number of seeds
-            avg_metrics['num_seeds'] = len(seed_results)
-            
-            # Add combination index
-            avg_metrics['combo_index'] = i + 1
-            
-            all_search_results.append(avg_metrics)
-            
-            # Print summary for this parameter combination
-            print(f"\n--- Summary for parameter combination {i+1} ---")
-            print(f"Parameters: {params}")
-            if 'accuracy_subset_mean' in avg_metrics:
-                print(f"Average Subset Accuracy: {avg_metrics['accuracy_subset_mean']:.4f} ± {avg_metrics['accuracy_subset_std']:.4f}")
-            if 'accuracy_elementwise_mean' in avg_metrics:
-                print(f"Average Element-wise Accuracy: {avg_metrics['accuracy_elementwise_mean']:.4f} ± {avg_metrics['accuracy_elementwise_std']:.4f}")
+            if global_best_updated:
+                global_best_info = new_global_best_info
+                save_global_best_model(global_best_info, output_dir, target_cols)
+                print(f"\n🏆 NEW GLOBAL BEST MODEL FOUND! 🏆")
+                print(f"Combination {i+1}, Epoch {best_epoch}")
+                print(f"Val Loss: {best_epoch_metrics.get('val_loss_mean', 0):.4f}")
+                print(f"Accuracy: {best_epoch_metrics.get('accuracy_subset_mean', 0):.4f}")
+        else:
+            print(f"Warning: no LoRA weights captured for best epoch {best_epoch} in combination {i+1}.")
+        
+        # Print summary for this parameter combination
+        print(f"\n--- Summary for parameter combination {i+1} ---")
+        print(f"Parameters: {params}")
+        print(f"Best Epoch: {best_epoch}")
+        print(f"Best Val Loss: {best_epoch_metrics.get('val_loss_mean', 0):.4f} ± {best_epoch_metrics.get('val_loss_std', 0):.4f}")
+        print(f"Best Accuracy (Subset): {best_epoch_metrics.get('accuracy_subset_mean', 0):.4f} ± {best_epoch_metrics.get('accuracy_subset_std', 0):.4f}")
+        print(f"Best ROC AUC (Macro): {best_epoch_metrics.get('roc_auc_macro_elementwise_mean', 0):.4f} ± {best_epoch_metrics.get('roc_auc_macro_elementwise_std', 0):.4f}")
+        print(f"Best F1 (Macro): {best_epoch_metrics.get('f1_macro_elementwise_mean', 0):.4f} ± {best_epoch_metrics.get('f1_macro_elementwise_std', 0):.4f}")
+        
+        # Print intermediate epoch results
+        print(f"\n--- All Epochs Performance ---")
+        for epoch, metrics in sorted(intermediate_results.items()):
+            val_loss = metrics.get('val_loss_mean', 0)
+            acc_subset = metrics.get('accuracy_subset_mean', 0)
+            roc_auc = metrics.get('roc_auc_macro_elementwise_mean', 0)
+            f1_macro = metrics.get('f1_macro_elementwise_mean', 0)
+            marker = "👑" if epoch == best_epoch else "  "
+            print(f"{marker} Epoch {epoch}: Val Loss = {val_loss:.4f} ± {metrics.get('val_loss_std', 0):.4f}, "
+                  f"Accuracy = {acc_subset:.4f} ± {metrics.get('accuracy_subset_std', 0):.4f}, "
+                  f"ROC AUC = {roc_auc:.4f} ± {metrics.get('roc_auc_macro_elementwise_std', 0):.4f}, "
+                  f"F1 = {f1_macro:.4f} ± {metrics.get('f1_macro_elementwise_std', 0):.4f}")
     
     # Save all search results
     if all_search_results:
@@ -780,6 +1041,11 @@ def run_hyperparameter_search(
             json.dump(best_params, f, indent=2)
         
         print(f"\n最佳参数已保存至 {best_params_path}")
+        
+        # Save global best model if found
+        if global_best_info is not None:
+            save_global_best_model(global_best_info, output_dir, target_cols)
+            print(f"\n🏆 全局最佳模型已保存至 {output_dir}/global_best_models/")
     
     print("\nLoRA hyperparameter search completed!")
     print(f"Results saved to {output_dir}")
@@ -820,7 +1086,7 @@ def main():
         'dropout': [0.0, 0.1, 0.2],  # 3个选项，增加0.0选项
         'learning_rate': [1e-5, 5e-5, 1e-4],  # 3个选项，减少5e-4
         'batch_size': [64],  # 1个选项
-        'num_epochs': [20]  # 1个选项
+        'num_epochs': [30]  # 1个选项，训练30个epoch但保存10、15、20、30的检查点
     }
     # 总组合数: 4 × 3 × 3 × 1 × 1 = 36个组合，远小于100
     

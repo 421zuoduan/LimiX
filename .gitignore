@@ -17,3 +17,5 @@ results/
 .spec-workflow
 
 test_checkpoints
+
+nohup.out

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict, Any
+from types import MethodType
 import math
 
 
@@ -123,6 +124,9 @@ class LoRAAdapter(nn.Module):
         self.dropout = dropout
         self.target_names = target_names
         self.merge_weights = merge_weights
+        self.original_forward = target_module.forward
+        self._patched_forward: Optional[MethodType] = None
+        self.merged = False
         
         # Store original weights
         self.original_weights = {}
@@ -130,7 +134,9 @@ class LoRAAdapter(nn.Module):
         
         # Apply LoRA to target parameters
         self._apply_lora()
-    
+        if not self.merge_weights:
+            self._patch_forward()
+
     def _apply_lora(self):
         """Apply LoRA to target parameters."""
         for name, param in self.target_module.named_parameters():
@@ -155,36 +161,52 @@ class LoRAAdapter(nn.Module):
                     )
                     
                     self.lora_layers[name] = lora_layer
-    
+
+    def _create_lora_forward(self) -> MethodType:
+        """Create a forward method that injects LoRA contributions."""
+        original_forward = self.original_forward
+        lora_layers = self.lora_layers
+
+        def lora_forward(module_self, input_tensor, *args, **kwargs):
+            output = original_forward(input_tensor, *args, **kwargs)
+
+            if not lora_layers:
+                return output
+
+            # Accumulate LoRA contributions across all adapted parameters
+            lora_contribution = None
+            for lora_layer in lora_layers.values():
+                contribution = lora_layer(input_tensor)
+                if contribution.shape != output.shape:
+                    contribution = contribution.view_as(output)
+                lora_contribution = contribution if lora_contribution is None else lora_contribution + contribution
+
+            if lora_contribution is None:
+                return output
+
+            return output + lora_contribution.to(output.dtype)
+
+        return MethodType(lora_forward, self.target_module)
+
+    def _patch_forward(self):
+        """Patch the target module forward with LoRA contributions."""
+        if self.merge_weights:
+            return
+
+        self._patched_forward = self._create_lora_forward()
+        self.target_module.forward = self._patched_forward
+
     def forward(self, *args, **kwargs):
         """Forward pass with LoRA applied."""
         # Store original forward
-        original_forward = self.target_module.forward
-        
-        # Hook to apply LoRA during forward
-        def lora_forward(*args, **kwargs):
-            # Get original output
-            output = original_forward(*args, **kwargs)
-            
-            # Add LoRA contribution
-            for name, lora_layer in self.lora_layers.items():
-                if name in self.original_weights:
-                    # Get input tensor (this is a simplified approach)
-                    # In practice, you'd need to hook into the specific layer
-                    if len(args) > 0:
-                        input_tensor = args[0]
-                        if input_tensor.dim() >= 2:
-                            # Apply LoRA
-                            lora_contribution = lora_layer(input_tensor)
-                            if output.shape == lora_contribution.shape:
-                                output = output + lora_contribution
-            
-            return output
-        
-        return lora_forward(*args, **kwargs)
-    
+        if self._patched_forward is None and not self.merge_weights:
+            self._patch_forward()
+        return self.target_module.forward(*args, **kwargs)
+
     def merge_weights_to_model(self):
         """Merge LoRA weights with original weights."""
+        if self.merged:
+            return
         for name, lora_layer in self.lora_layers.items():
             if name in self.original_weights:
                 # Compute merged weights
@@ -199,7 +221,10 @@ class LoRAAdapter(nn.Module):
                     if param_name == name:
                         param.data.copy_(merged_weight)
                         break
-    
+        if self._patched_forward is not None:
+            self.target_module.forward = self.original_forward
+        self.merged = True
+
     def unmerge_weights_from_model(self):
         """Restore original weights."""
         for name, original_weight in self.original_weights.items():
@@ -207,7 +232,10 @@ class LoRAAdapter(nn.Module):
                 if param_name == name:
                     param.data = original_weight.clone()
                     break
-    
+        if self.merged:
+            self.merged = False
+            self._patch_forward()
+
     def get_lora_parameters(self):
         """Get LoRA parameters for optimization."""
         params = []
@@ -330,6 +358,19 @@ class LoRAEnabledTransformer(nn.Module):
         """Unmerge all LoRA weights."""
         for adapter in self.lora_adapters.values():
             adapter.unmerge_weights_from_model()
+    
+    def get_lora_state_dict(self) -> Dict[str, torch.Tensor]:
+        """Return all LoRA weights as a state dict."""
+        lora_state_dict = {}
+        for adapter_name, adapter in self.lora_adapters.items():
+            for name, lora_layer in adapter.lora_layers.items():
+                full_name = f"{adapter_name}.{name}"
+                lora_state_dict[f"{full_name}.lora_A"] = lora_layer.lora_A.detach().cpu().clone()
+                lora_state_dict[f"{full_name}.lora_B"] = lora_layer.lora_B.detach().cpu().clone()
+                lora_state_dict[f"{full_name}.scaling"] = torch.tensor(
+                    float(lora_layer.scaling), dtype=torch.float32
+                )
+        return lora_state_dict
     
     def save_lora_weights(self, path: str):
         """Save all LoRA weights."""

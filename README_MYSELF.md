@@ -16,8 +16,9 @@
 
 ## train/lora 模块
 - **目标**：对 LimiX 模型进行轻量 LoRA 微调，使其适配特定医疗任务。
-- **核心脚本**：`train_lora.py` 定义训练流程，`run_lora_finetuning.py` 统一处理数据加载、循环种子、结果汇总。
-- **指标输出**：`results/lora/` 中每个种子会保存 `results.csv`、`best_lora_model.pth`、`best_lora_weights.pth`。summary CSV 采用与 inference_med 相同的双行布局。
+- **核心脚本**：`train_lora.py` 定义单次训练流程，`run_lora_finetuning.py` 统一处理多种子实验，`lora_hyperparameter_search.py` 负责多参数组合搜索并自动比较不同 epoch。
+- **指标输出**：超参搜索只为每组参数生成一份轻量目录 `results/lora_hyperparameter_search/combo_*/`，其中 `epoch_summary.csv` 记录 10/20/30 epoch 的多种子均值与方差；全局最佳的 LoRA 权重会覆盖式地写入 `results/lora_hyperparameter_search/global_best_models/`。
+- **评估策略**：每个参数组合仅训练一次 30 epoch，同时缓存第 10/20/30 epoch；对这些 epoch 先做跨种子平均，再以验证集 loss（并在需要时用 subset accuracy 打破平手）挑出最终成绩和需保留的权重。
 - **GPU 与性能注意**：虽只训练 LoRA 权重，但仍需完整前向；建议使用较大的 batch、开启 CUDA 混合精度以提升吞吐。
 - **运行示例**：
   ```bash
@@ -32,7 +33,7 @@
   ```
 - **与推理对齐**：LoRA 训练和 inference_med 共享 `Element-wise` 与 `Subset/Samples` 两套指标，可直接比对微调增益。
 - **调参建议**：
-  - **训练配置**：增大 `--num_epochs`（建议 ≥5），尝试更大的 `--batch_size` 或梯度累积，调节学习率（1e-4 ↔︎ 5e-4 / 5e-5）并考虑 warmup/余弦退火。
+  - **训练配置**：针对超参搜索，`--num_epochs` 固定为 30 以一次性获得 10/20/30 epoch 表现；自定义脚本中仍可调节 epoch、批量或学习率（1e-4 ↔︎ 5e-4 / 5e-5），并配合 warmup/余弦退火。
   - **LoRA 结构**：探索更高 `rank`、`alpha` 或增加 `target_layers`（例如 [8, 9, 10, 11]），必要时仅对注意力/MLP 子层挂 LoRA。
   - **损失与样本**：对极度不平衡标签设置 `BCEWithLogitsLoss(pos_weight)`，或在 DataLoader 中上采样正例。
   - **推理配置**：测试 `cls_default_retrieval.json`、`softmax_temperature`、阈值校准等，使推理阶段更贴近 LoRA 训练。
@@ -46,4 +47,4 @@
 ## 推荐工作流
 1. 使用 `inference_med` 获取 LimiX 基线元素级/样本级性能。
 2. 运行 `train/lora/run_lora_finetuning.py` 做任务定制；比对 `results` 与 `summary` CSV 了解微调增益。
-3. 在推理阶段加载 `best_lora_weights.pth`（仅 LoRA 参数）搭配基础模型，降低部署负担。
+3. 在推理阶段加载保存的 LoRA 权重（单次训练位于 `best_lora_weights.pth`，超参搜索位于 `global_best_models/{target}_best_weights.pth`）搭配基础模型，降低部署负担。
