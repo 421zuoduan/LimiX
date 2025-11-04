@@ -797,7 +797,7 @@ def update_global_best_model(
     new_combination_params: Dict,
     new_combination_weights_record: Dict[str, Any],
     primary_metric: str = 'val_loss_mean',
-    secondary_metric: str = 'accuracy_subset_mean'
+    secondary_metric: str = 'accuracy_samples_mean'
 ) -> Tuple[bool, Dict]:
     """
     更新全局最佳模型
@@ -1109,7 +1109,15 @@ def run_hyperparameter_search(
                 print(f"\n🏆 NEW GLOBAL BEST MODEL FOUND! 🏆")
                 print(f"Combination {i+1}, Epoch {best_epoch}")
                 print(f"Val Loss: {best_epoch_metrics.get('val_loss_mean', 0):.4f}")
-                print(f"Accuracy: {best_epoch_metrics.get('accuracy_subset_mean', 0):.4f}")
+                print(f"Accuracy (Samples): {best_epoch_metrics.get('accuracy_samples_mean', 0):.4f}")
+                print(f"Accuracy (Macro): {best_epoch_metrics.get('accuracy_macro_mean', 0):.4f}")
+                print(f"Accuracy (Micro): {best_epoch_metrics.get('accuracy_micro_mean', 0):.4f}")
+                print(f"F1 Score (Macro): {best_epoch_metrics.get('f1_macro_mean', 0):.4f}")
+                print(f"F1 Score (Micro): {best_epoch_metrics.get('f1_micro_mean', 0):.4f}")
+                print(f"F1 Score (Samples): {best_epoch_metrics.get('f1_samples_mean', 0):.4f}")
+                print(f"ROC AUC (Macro): {best_epoch_metrics.get('roc_auc_macro_mean', 0):.4f}")
+                print(f"ROC AUC (Micro): {best_epoch_metrics.get('roc_auc_micro_mean', 0):.4f}")
+                print(f"ROC AUC (Samples): {best_epoch_metrics.get('roc_auc_samples_mean', 0):.4f}")
         else:
             print(f"Warning: no LoRA weights captured for best epoch {best_epoch} in combination {i+1}.")
         
