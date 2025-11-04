@@ -113,7 +113,7 @@ class MultiLabelLimiXInference:
     
     def _calculate_metrics(self, y_true: np.ndarray, y_pred_proba: np.ndarray, seed: int) -> Dict[str, float]:
         """
-        计算多标签分类性能指标
+        计算多标签分类性能指标（使用sklearn标准方法）
         
         Args:
             y_true: 真实标签
@@ -132,46 +132,38 @@ class MultiLabelLimiXInference:
                 print(f"{func.__name__}计算失败: {err}")
                 return default
         
-        metrics['roc_auc_macro_elementwise'] = safe_metric(
+        # ROC-AUC 指标
+        metrics['roc_auc_macro'] = safe_metric(
             roc_auc_score, y_true, y_pred_proba, average='macro'
         )
-        metrics['roc_auc_samples_subset'] = safe_metric(
+        metrics['roc_auc_micro'] = safe_metric(
+            roc_auc_score, y_true, y_pred_proba, average='micro'
+        )
+        metrics['roc_auc_samples'] = safe_metric(
             roc_auc_score, y_true, y_pred_proba, average='samples'
-        )
-        metrics['avg_precision_macro_elementwise'] = safe_metric(
-            average_precision_score, y_true, y_pred_proba, average='macro'
-        )
-        metrics['avg_precision_samples_subset'] = safe_metric(
-            average_precision_score, y_true, y_pred_proba, average='samples'
         )
         
         # F1 Score (使用0.5阈值)
         y_pred = (y_pred_proba >= 0.5).astype(int)
-        try:
-            metrics['f1_micro_elementwise'] = f1_score(y_true, y_pred, average='micro')
-            metrics['f1_macro_elementwise'] = f1_score(y_true, y_pred, average='macro')
-            metrics['f1_samples_subset'] = f1_score(y_true, y_pred, average='samples')
-            metrics['precision_macro_elementwise'] = precision_score(y_true, y_pred, average='macro', zero_division=0)
-            metrics['precision_samples_subset'] = precision_score(y_true, y_pred, average='samples', zero_division=0)
-            metrics['recall_macro_elementwise'] = recall_score(y_true, y_pred, average='macro', zero_division=0)
-            metrics['recall_samples_subset'] = recall_score(y_true, y_pred, average='samples', zero_division=0)
-            accuracy_elementwise = (y_pred == y_true).mean()
-            accuracy_subset = (y_pred == y_true).all(axis=1).mean()
-            metrics['accuracy_elementwise'] = accuracy_elementwise
-            metrics['accuracy_subset'] = accuracy_subset
-            metrics['accuracy'] = accuracy_elementwise  # backward compatibility
-        except Exception as e:
-            print(f"F1 Score计算失败: {e}")
-            metrics['f1_micro_elementwise'] = np.nan
-            metrics['f1_macro_elementwise'] = np.nan
-            metrics['f1_samples_subset'] = np.nan
-            metrics['precision_macro_elementwise'] = np.nan
-            metrics['precision_samples_subset'] = np.nan
-            metrics['recall_macro_elementwise'] = np.nan
-            metrics['recall_samples_subset'] = np.nan
-            metrics['accuracy_elementwise'] = np.nan
-            metrics['accuracy_subset'] = np.nan
-            metrics['accuracy'] = np.nan
+        
+        metrics['f1_macro'] = safe_metric(
+            f1_score, y_true, y_pred, average='macro', zero_division=0
+        )
+        metrics['f1_micro'] = safe_metric(
+            f1_score, y_true, y_pred, average='micro', zero_division=0
+        )
+        metrics['f1_samples'] = safe_metric(
+            f1_score, y_true, y_pred, average='samples', zero_division=0
+        )
+        
+        # Accuracy
+        accuracy_macro = (y_pred == y_true).mean()
+        accuracy_micro = (y_pred == y_true).mean()  # 对于多标签，micro和macro计算方式相同
+        accuracy_samples = (y_pred == y_true).all(axis=1).mean()
+        metrics['accuracy_macro'] = accuracy_macro
+        metrics['accuracy_micro'] = accuracy_micro
+        metrics['accuracy_samples'] = accuracy_samples
+        metrics['accuracy'] = accuracy_macro  # backward compatibility
         
         return metrics
     
@@ -199,9 +191,9 @@ class MultiLabelLimiXInference:
         # 对每个种子执行分析
         for seed in seeds:
             metrics = self.run_single_seed(X, y, seed)
-            if 'accuracy_subset' in metrics and 'accuracy_elementwise' in metrics:
-                print(f"  Subset Accuracy: {metrics['accuracy_subset']:.4f}")
-                print(f"  Element-wise Accuracy: {metrics['accuracy_elementwise']:.4f}")
+            if 'accuracy_samples' in metrics and 'accuracy_macro' in metrics:
+                print(f"  Samples Accuracy: {metrics['accuracy_samples']:.4f}")
+                print(f"  Macro Accuracy: {metrics['accuracy_macro']:.4f}")
             all_metrics.append(metrics)
         
         # 汇总结果
@@ -252,11 +244,11 @@ class MultiLabelLimiXInference:
         import os
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
-        # 保存详细结果
-        results_df.to_csv(output_path, index=False)
+        # 保存详细结果（覆盖已存在的文件）
+        results_df.to_csv(output_path, index=False, mode='w')
         print(f"\n详细结果已保存至 {output_path}")
         
-        # 保存均值结果（mean±std），按 Element-wise 与 Subset/Samples 两行展示
+        # 保存均值结果（mean±std），按 Macro、Micro 与 Samples 三行展示
         num_seeds = len(all_metrics)
 
         def format_metric(col_name: str) -> str:
@@ -270,32 +262,31 @@ class MultiLabelLimiXInference:
 
         summary_rows = [
             {
-                'group': 'Element-wise',
+                'group': 'Macro',
                 'num_seeds': num_seeds,
-                'accuracy': format_metric('accuracy_elementwise'),
-                'precision': format_metric('precision_macro_elementwise'),
-                'recall': format_metric('recall_macro_elementwise'),
-                'f1': format_metric('f1_macro_elementwise'),
-                'f1_micro': format_metric('f1_micro_elementwise'),
-                'roc_auc': format_metric('roc_auc_macro_elementwise'),
-                'avg_precision': format_metric('avg_precision_macro_elementwise')
+                'accuracy': format_metric('accuracy_macro'),
+                'f1': format_metric('f1_macro'),
+                'roc_auc': format_metric('roc_auc_macro')
             },
             {
-                'group': 'Subset/Samples',
+                'group': 'Micro',
                 'num_seeds': num_seeds,
-                'accuracy': format_metric('accuracy_subset'),
-                'precision': format_metric('precision_samples_subset'),
-                'recall': format_metric('recall_samples_subset'),
-                'f1': format_metric('f1_samples_subset'),
-                'f1_micro': '-',
-                'roc_auc': format_metric('roc_auc_samples_subset'),
-                'avg_precision': format_metric('avg_precision_samples_subset')
+                'accuracy': format_metric('accuracy_micro'),
+                'f1': format_metric('f1_micro'),
+                'roc_auc': format_metric('roc_auc_micro')
+            },
+            {
+                'group': 'Samples',
+                'num_seeds': num_seeds,
+                'accuracy': format_metric('accuracy_samples'),
+                'f1': format_metric('f1_samples'),
+                'roc_auc': format_metric('roc_auc_samples')
             }
         ]
 
         summary_df = pd.DataFrame(summary_rows)
         
-        summary_df.to_csv(summary_path, index=False)
+        summary_df.to_csv(summary_path, index=False, mode='w')
         print(f"均值结果已保存至 {summary_path}")
         print(f"注意：summary文件现在保存的是多个种子的指标平均值和标准差，而不是最高值")
 

@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, f1_score, average_precision_score, precision_score, recall_score
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -135,41 +136,41 @@ class MultiLabelLimiXLoraInference(MultiLabelLimiXInference):
         if hasattr(base_model, "device"):
             lora_model.device = base_model.device
 
-        # 打印模型结构
-        print("\n" + "="*80)
-        print("LoRA模型结构信息")
-        print("="*80)
-        print(f"基础模型类型: {type(base_model).__name__}")
-        print(f"LoRA目标层: {self.lora_target_layers}")
-        print(f"LoRA rank: {self.lora_rank}")
-        print(f"LoRA alpha: {self.lora_alpha}")
-        print(f"LoRA dropout: {self.lora_dropout}")
-        print(f"LoRA权重路径: {self.lora_weights_path}")
+        # # 打印模型结构
+        # print("\n" + "="*80)
+        # print("LoRA模型结构信息")
+        # print("="*80)
+        # print(f"基础模型类型: {type(base_model).__name__}")
+        # print(f"LoRA目标层: {self.lora_target_layers}")
+        # print(f"LoRA rank: {self.lora_rank}")
+        # print(f"LoRA alpha: {self.lora_alpha}")
+        # print(f"LoRA dropout: {self.lora_dropout}")
+        # print(f"LoRA权重路径: {self.lora_weights_path}")
         
-        print("\n完整模型结构:")
-        print(lora_model)
+        # print("\n完整模型结构:")
+        # print(lora_model)
         
-        # 打印LoRA参数信息
-        print("\nLoRA参数信息:")
-        lora_params = []
-        for name, param in lora_model.named_parameters():
-            if 'lora' in name.lower():
-                lora_params.append((name, param.shape, param.requires_grad))
+        # # 打印LoRA参数信息
+        # print("\nLoRA参数信息:")
+        # lora_params = []
+        # for name, param in lora_model.named_parameters():
+        #     if 'lora' in name.lower():
+        #         lora_params.append((name, param.shape, param.requires_grad))
         
-        if lora_params:
-            print("LoRA层参数:")
-            for name, shape, requires_grad in lora_params:
-                print(f"  {name}: {shape}, 训练中: {requires_grad}")
-        else:
-            print("未找到LoRA参数")
+        # if lora_params:
+        #     print("LoRA层参数:")
+        #     for name, shape, requires_grad in lora_params:
+        #         print(f"  {name}: {shape}, 训练中: {requires_grad}")
+        # else:
+        #     print("未找到LoRA参数")
         
-        # 打印模型总参数量
-        total_params = sum(p.numel() for p in lora_model.parameters())
-        trainable_params = sum(p.numel() for p in lora_model.parameters() if p.requires_grad)
-        print(f"\n模型总参数量: {total_params:,}")
-        print(f"可训练参数量: {trainable_params:,}")
-        print(f"LoRA参数占比: {trainable_params/total_params*100:.4f}%")
-        print("="*80 + "\n")
+        # # 打印模型总参数量
+        # total_params = sum(p.numel() for p in lora_model.parameters())
+        # trainable_params = sum(p.numel() for p in lora_model.parameters() if p.requires_grad)
+        # print(f"\n模型总参数量: {total_params:,}")
+        # print(f"可训练参数量: {trainable_params:,}")
+        # print(f"LoRA参数占比: {trainable_params/total_params*100:.4f}%")
+        # print("="*80 + "\n")
 
         predictor.model = lora_model
         return predictor
@@ -210,6 +211,205 @@ class MultiLabelLimiXLoraInference(MultiLabelLimiXInference):
 
         metrics = self._calculate_metrics(y_test, predictions, seed)
         return metrics
+    
+    def _calculate_metrics(self, y_true: np.ndarray, y_pred_proba: np.ndarray, seed: int) -> Dict[str, float]:
+        """
+        计算多标签分类性能指标（使用sklearn标准方法）
+        
+        Args:
+            y_true: 真实标签
+            y_pred_proba: 预测概率
+            seed: 随机种子
+            
+        Returns:
+            指标字典
+        """
+        metrics = {'seed': seed}
+        
+        def safe_metric(func, *args, default=np.nan, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except Exception as err:
+                print(f"{func.__name__}计算失败: {err}")
+                return default
+        
+        # ROC-AUC 指标
+        metrics['roc_auc_macro'] = safe_metric(
+            roc_auc_score, y_true, y_pred_proba, average='macro'
+        )
+        metrics['roc_auc_micro'] = safe_metric(
+            roc_auc_score, y_true, y_pred_proba, average='micro'
+        )
+        metrics['roc_auc_samples'] = safe_metric(
+            roc_auc_score, y_true, y_pred_proba, average='samples'
+        )
+        
+        # F1 Score (使用0.5阈值)
+        y_pred = (y_pred_proba >= 0.5).astype(int)
+        
+        metrics['f1_macro'] = safe_metric(
+            f1_score, y_true, y_pred, average='macro', zero_division=0
+        )
+        metrics['f1_micro'] = safe_metric(
+            f1_score, y_true, y_pred, average='micro', zero_division=0
+        )
+        metrics['f1_samples'] = safe_metric(
+            f1_score, y_true, y_pred, average='samples', zero_division=0
+        )
+        
+        # Accuracy
+        accuracy_macro = (y_pred == y_true).mean()
+        accuracy_micro = (y_pred == y_true).mean()  # 对于多标签，micro和macro计算方式相同
+        accuracy_samples = (y_pred == y_true).all(axis=1).mean()
+        metrics['accuracy_macro'] = accuracy_macro
+        metrics['accuracy_micro'] = accuracy_micro
+        metrics['accuracy_samples'] = accuracy_samples
+        metrics['accuracy'] = accuracy_macro  # backward compatibility
+        
+        return metrics
+    
+    def _summarize_results(self, all_metrics: List[Dict[str, float]], target_cols: List[str]):
+        """
+        汇总和打印结果，并保存到指定目录（LoRA版本）
+        
+        Args:
+            all_metrics: 所有种子的性能指标
+            target_cols: 目标变量列名列表
+        """
+        print("\n" + "="*50)
+        print("最终结果汇总 (LoRA)")
+        print("="*50)
+        
+        # 转换为DataFrame便于分析
+        import pandas as pd
+        results_df = pd.DataFrame(all_metrics)
+        
+        # 打印每个种子的结果
+        print("\n各种子性能:")
+        print(results_df.to_string(index=False))
+        
+        # 计算平均值和标准差
+        print("\n性能指标汇总 (mean ± std):")
+        numeric_cols = results_df.select_dtypes(include=[np.number]).columns
+        summary = results_df[numeric_cols].agg(['mean', 'std']).round(4)
+        
+        for col in numeric_cols:
+            if col != 'seed':
+                mean_val = summary.loc['mean', col]
+                std_val = summary.loc['std', col]
+                mean_display = 0.0 if pd.isna(mean_val) else float(mean_val)
+                std_display = 0.0 if pd.isna(std_val) else float(std_val)
+                print(f"{col}: {mean_display:.4f}±{std_display:.4f}")
+        
+        # 保存结果到指定目录
+        # 将目标列名组合成文件名
+        target_name = "_".join(target_cols)
+        output_path = f'results/multi_label_predict_lora/{target_name}_results.csv'
+        summary_path = f'results/multi_label_predict_lora/{target_name}_summary.csv'
+        
+        # 确保目录存在
+        import os
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        # 保存详细结果（覆盖已存在的文件）
+        results_df.to_csv(output_path, index=False, mode='w')
+        print(f"\n详细结果已保存至 {output_path}")
+        
+        # 保存均值结果（mean±std），按 Macro、Micro 与 Samples 三行展示
+        num_seeds = len(all_metrics)
+
+        def format_metric(col_name: str) -> str:
+            if col_name not in summary.columns:
+                return "-"
+            mean_val = summary.loc['mean', col_name]
+            std_val = summary.loc['std', col_name]
+            mean_display = 0.0 if pd.isna(mean_val) else float(mean_val)
+            std_display = 0.0 if pd.isna(std_val) else float(std_val)
+            return f"{mean_display:.4f}±{std_display:.4f}"
+
+        summary_rows = [
+            {
+                'group': 'Macro',
+                'num_seeds': num_seeds,
+                'accuracy': format_metric('accuracy_macro'),
+                'f1': format_metric('f1_macro'),
+                'roc_auc': format_metric('roc_auc_macro')
+            },
+            {
+                'group': 'Micro',
+                'num_seeds': num_seeds,
+                'accuracy': format_metric('accuracy_micro'),
+                'f1': format_metric('f1_micro'),
+                'roc_auc': format_metric('roc_auc_micro')
+            },
+            {
+                'group': 'Samples',
+                'num_seeds': num_seeds,
+                'accuracy': format_metric('accuracy_samples'),
+                'f1': format_metric('f1_samples'),
+                'roc_auc': format_metric('roc_auc_samples')
+            }
+        ]
+
+        summary_df = pd.DataFrame(summary_rows)
+        
+        summary_df.to_csv(summary_path, index=False, mode='w')
+        print(f"均值结果已保存至 {summary_path}")
+        print(f"注意：summary文件现在保存的是多个种子的指标平均值和标准差，而不是最高值")
+        
+        # 保存LoRA元数据信息
+        lora_metadata_path = f'results/multi_label_predict_lora/{target_name}_lora_metadata.json'
+        lora_metadata_info = {
+            'lora_metadata_path': str(self.lora_metadata_path),
+            'lora_weights_path': str(self.lora_weights_path),
+            'lora_params': self.lora_params,
+            'lora_rank': self.lora_rank,
+            'lora_dropout': self.lora_dropout,
+            'lora_alpha': self.lora_alpha,
+            'lora_target_layers': self.lora_target_layers,
+            'model_path': self.model_path,
+            'config_path': self.config_path
+        }
+        
+        with open(lora_metadata_path, 'w', encoding='utf-8') as f:
+            json.dump(lora_metadata_info, f, ensure_ascii=False, indent=2)
+        print(f"LoRA元数据已保存至 {lora_metadata_path}")
+    
+    def run_analysis(self, file_path: str, target_cols: List[str], seeds: List[int] = [10, 20, 30, 40, 50]):
+        """
+        执行完整分析流程（LoRA版本）
+        
+        Args:
+            file_path: Excel文件路径
+            target_cols: 目标变量列名列表
+            seeds: 随机种子列表
+        """
+        print("开始多标签预测分析 (LoRA)")
+        print(f"模型路径: {self.model_path}")
+        print(f"配置文件: {self.config_path}")
+        print(f"LoRA元数据路径: {self.lora_metadata_path}")
+        print(f"LoRA权重路径: {self.lora_weights_path}")
+        print(f"目标变量: {target_cols}")
+        print(f"随机种子: {seeds}")
+        
+        # 加载数据
+        X, y = self.load_data(file_path, target_cols)
+        
+        # 存储所有结果
+        all_metrics = []
+        
+        # 对每个种子执行分析
+        for seed in seeds:
+            metrics = self.run_single_seed(X, y, seed)
+            if 'accuracy_samples' in metrics and 'accuracy_macro' in metrics:
+                print(f"  Samples Accuracy: {metrics['accuracy_samples']:.4f}")
+                print(f"  Macro Accuracy: {metrics['accuracy_macro']:.4f}")
+            all_metrics.append(metrics)
+        
+        # 汇总结果
+        self._summarize_results(all_metrics, target_cols)
+        
+        return all_metrics
 
 
 if __name__ == "__main__":
@@ -218,7 +418,7 @@ if __name__ == "__main__":
     DATA_PATH = "/home/ruochen/data/medtable_术前特征_processed-多变量预测.xlsx"
     TARGET_COLS = ["脑脊液漏", "神经功能加重", "严重并发症（死亡＋瘫痪＋再手术＋再入院）"]
     LORA_METADATA = (
-        "results/lora_hyperparameter_search_64_rank/global_best_models/"
+        "results/lora_hyperparameter_search/global_best_models/"
         "脑脊液漏_神经功能加重_严重并发症（死亡＋瘫痪＋再手术＋再入院）_best_metadata.json"
     )
     SEEDS = [10, 20, 30, 40, 50]

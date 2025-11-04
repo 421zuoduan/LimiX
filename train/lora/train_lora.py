@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, average_precision_score
 from sklearn.preprocessing import LabelEncoder
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -63,7 +63,8 @@ class LoRATrainer:
         learning_rate: float = 1e-4,
         batch_size: int = 64,  # 增大默认 batch size
         num_epochs: int = 10,
-        device: str = 'cuda'
+        device: str = 'cuda',
+        run_seed: Optional[int] = None
     ):
         """
         Initialize LoRA trainer.
@@ -78,6 +79,7 @@ class LoRATrainer:
             batch_size: Batch size for training
             num_epochs: Number of training epochs
             device: Device to use for training
+            run_seed: Seed identifier for the current run (stored in checkpoint metadata)
         """
         self.model_path = model_path
         self.target_layers = target_layers
@@ -89,6 +91,7 @@ class LoRATrainer:
         self.batch_size = batch_size
         self.num_epochs = num_epochs
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        self.run_seed = run_seed
         
         # Load base model
         self.base_model = load_model(model_path)
@@ -117,6 +120,50 @@ class LoRATrainer:
         self.train_losses = []
         self.val_losses = []
         self.val_metrics = []
+        self.metric_trackers = {
+            'val_loss': {
+                'best': float('inf'),
+                'mode': 'min',
+                'base_name': 'best_lora',
+                'display': 'Val Loss'
+            },
+            'accuracy_subset': {
+                'best': -float('inf'),
+                'mode': 'max',
+                'base_name': 'best_accuracy_subset',
+                'display': 'Subset Accuracy'
+            },
+            'accuracy_elementwise': {
+                'best': -float('inf'),
+                'mode': 'max',
+                'base_name': 'best_accuracy_elementwise',
+                'display': 'Element-wise Accuracy'
+            },
+            'f1_macro_elementwise': {
+                'best': -float('inf'),
+                'mode': 'max',
+                'base_name': 'best_f1_macro',
+                'display': 'Macro F1'
+            },
+            'f1_micro_elementwise': {
+                'best': -float('inf'),
+                'mode': 'max',
+                'base_name': 'best_f1_micro',
+                'display': 'Micro F1'
+            },
+            'roc_auc_macro_elementwise': {
+                'best': -float('inf'),
+                'mode': 'max',
+                'base_name': 'best_roc_auc_macro',
+                'display': 'Macro ROC-AUC'
+            },
+            'roc_auc_micro_elementwise': {
+                'best': -float('inf'),
+                'mode': 'max',
+                'base_name': 'best_roc_auc_micro',
+                'display': 'Micro ROC-AUC'
+            }
+        }
     
     def load_data(self, file_path: str, target_cols: List[str]) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -449,6 +496,9 @@ class LoRATrainer:
             roc_auc_macro = safe_metric(
                 roc_auc_score, all_targets, all_predictions, average='macro'
             )
+            roc_auc_micro = safe_metric(
+                roc_auc_score, all_targets, all_predictions, average='micro'
+            )
             roc_auc_samples = safe_metric(
                 roc_auc_score, all_targets, all_predictions, average='samples'
             )
@@ -470,10 +520,17 @@ class LoRATrainer:
                 'f1_micro_elementwise': f1_micro,
                 'f1_samples_subset': f1_samples,
                 'roc_auc_macro_elementwise': roc_auc_macro,
+                'roc_auc_micro_elementwise': roc_auc_micro,
                 'roc_auc_samples_subset': roc_auc_samples,
                 'avg_precision_macro_elementwise': avg_precision_macro,
                 'avg_precision_samples_subset': avg_precision_samples
             }
+            metrics.update({
+                'f1_macro': f1_macro,
+                'f1_micro': f1_micro,
+                'roc_auc_macro': roc_auc_macro,
+                'roc_auc_micro': roc_auc_micro
+            })
         else:
             metrics = {
                 'accuracy_subset': 0.0,
@@ -486,12 +543,93 @@ class LoRATrainer:
                 'f1_micro_elementwise': 0.0,
                 'f1_samples_subset': 0.0,
                 'roc_auc_macro_elementwise': 0.0,
+                'roc_auc_micro_elementwise': 0.0,
                 'roc_auc_samples_subset': 0.0,
                 'avg_precision_macro_elementwise': 0.0,
                 'avg_precision_samples_subset': 0.0
             }
+            metrics.update({
+                'f1_macro': 0.0,
+                'f1_micro': 0.0,
+                'roc_auc_macro': 0.0,
+                'roc_auc_micro': 0.0
+            })
         
         return avg_loss, metrics
+
+    def _is_finite_number(self, value) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, (float, int, np.floating, np.integer)):
+            return np.isfinite(value)
+        return False
+
+    def _update_best_models(
+        self,
+        save_dir: str,
+        epoch_idx: int,
+        val_loss: float,
+        val_metrics: Dict[str, float]
+    ):
+        metrics_to_check = {'val_loss': val_loss}
+        metrics_to_check.update({
+            'accuracy_subset': val_metrics.get('accuracy_subset'),
+            'accuracy_elementwise': val_metrics.get('accuracy_elementwise'),
+            'f1_macro_elementwise': val_metrics.get('f1_macro_elementwise'),
+            'f1_micro_elementwise': val_metrics.get('f1_micro_elementwise'),
+            'roc_auc_macro_elementwise': val_metrics.get('roc_auc_macro_elementwise'),
+            'roc_auc_micro_elementwise': val_metrics.get('roc_auc_micro_elementwise'),
+        })
+
+        for metric_key, current_value in metrics_to_check.items():
+            tracker = self.metric_trackers.get(metric_key)
+            if tracker is None or not self._is_finite_number(current_value):
+                continue
+
+            better = (
+                current_value < tracker['best']
+                if tracker['mode'] == 'min'
+                else current_value > tracker['best']
+            )
+            if not better:
+                continue
+
+            tracker['best'] = float(current_value)
+            base_name = tracker['base_name']
+            metric_label = tracker['display']
+
+            if metric_key == 'val_loss':
+                model_path = os.path.join(save_dir, f'{base_name}_model.pth')
+                weights_path = os.path.join(save_dir, f'{base_name}_weights.pth')
+                self.save_checkpoint(model_path, epoch_idx, val_loss, val_metrics)
+                self.model.save_lora_weights(weights_path)
+                meta_path = os.path.join(save_dir, f'{base_name}_metrics.json')
+            else:
+                model_path = None
+                weights_path = os.path.join(save_dir, f'{base_name}_weights.pth')
+                meta_path = os.path.join(save_dir, f'{base_name}_metrics.json')
+                self.model.save_lora_weights(weights_path)
+            val_loss_value = float(val_loss) if self._is_finite_number(val_loss) else None
+            metrics_snapshot = {}
+            for key, value in val_metrics.items():
+                if self._is_finite_number(value):
+                    metrics_snapshot[key] = float(value)
+                else:
+                    metrics_snapshot[key] = None
+            metadata = {
+                'metric_key': metric_key,
+                'metric_display': metric_label,
+                'metric_value': float(current_value),
+                'epoch': int(epoch_idx + 1),
+                'val_loss_at_save': val_loss_value,
+                'seed': int(self.run_seed) if self.run_seed is not None else None,
+                'checkpoint_path': model_path if metric_key == 'val_loss' else None,
+                'weights_path': weights_path,
+                'val_metrics': metrics_snapshot
+            }
+            with open(meta_path, 'w', encoding='utf-8') as meta_file:
+                json.dump(metadata, meta_file, ensure_ascii=False, indent=2)
+            print(f"Saved new best {metric_label} ({current_value:.4f}) at epoch {epoch_idx + 1} -> {weights_path}")
     
     def train(
         self, 
@@ -508,8 +646,6 @@ class LoRATrainer:
             save_dir: Directory to save checkpoints
         """
         os.makedirs(save_dir, exist_ok=True)
-        
-        best_val_loss = float('inf')
         
         for epoch in range(self.num_epochs):
             print(f"\nEpoch {epoch+1}/{self.num_epochs}")
@@ -532,17 +668,8 @@ class LoRATrainer:
                 print(f"Val Accuracy (element-wise): {val_metrics['accuracy_elementwise']:.4f}")
             print(f"Val Metrics: {val_metrics}")
             
-            # Save best model
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_model_path = os.path.join(save_dir, 'best_lora_model.pth')
-                self.save_checkpoint(best_model_path, epoch, val_loss, val_metrics)
-                print(f"Saved best model to {best_model_path}")
-                
-                # Also save LoRA-only weights alongside the best checkpoint
-                lora_only_path = os.path.join(save_dir, 'best_lora_weights.pth')
-                self.save_lora_weights(lora_only_path)
-                print(f"Saved LoRA weights to {lora_only_path}")
+            # Save checkpoints for improved metrics
+            self._update_best_models(save_dir, epoch, val_loss, val_metrics)
             
             # Save regular checkpoint
             if (epoch + 1) % 5 == 0:
@@ -659,7 +786,8 @@ def main():
             learning_rate=args.learning_rate,
             batch_size=args.batch_size,
             num_epochs=args.num_epochs,
-            device=args.device
+            device=args.device,
+            run_seed=seed
         )
         
         # Prepare data

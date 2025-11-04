@@ -164,7 +164,8 @@ def run_lora_finetuning(
                 learning_rate=learning_rate,
                 batch_size=batch_size,
                 num_epochs=num_epochs,
-                device='cuda' if torch.cuda.is_available() else 'cpu'
+                device='cuda' if torch.cuda.is_available() else 'cpu',
+                run_seed=seed
             )
             
             # Prepare data for LoRA training - use all targets together
@@ -259,6 +260,8 @@ def run_lora_finetuning(
                 'f1': format_metric('lora_f1_macro_elementwise'),
                 'f1_micro': format_metric('lora_f1_micro_elementwise'),
                 'roc_auc': format_metric('lora_roc_auc_macro_elementwise'),
+                'roc_auc_micro': format_metric('lora_roc_auc_micro_elementwise'),
+                'roc_auc_macro': format_metric('lora_roc_auc_macro_elementwise'),
                 'avg_precision': format_metric('lora_avg_precision_macro_elementwise')
             },
             {
@@ -270,6 +273,8 @@ def run_lora_finetuning(
                 'f1': format_metric('lora_f1_samples_subset'),
                 'f1_micro': '-',
                 'roc_auc': format_metric('lora_roc_auc_samples_subset'),
+                'roc_auc_micro': '-',
+                'roc_auc_macro': format_metric('lora_roc_auc_samples_subset'),
                 'avg_precision': format_metric('lora_avg_precision_samples_subset')
             }
         ]

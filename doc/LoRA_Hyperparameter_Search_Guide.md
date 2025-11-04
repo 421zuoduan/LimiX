@@ -122,6 +122,7 @@ output_dir/
 
 - **ROC AUC指标**：
   - `roc_auc_macro_elementwise`: 宏平均ROC-AUC
+  - `roc_auc_micro_elementwise`: 微平均ROC-AUC
   - `roc_auc_samples_subset`: 样本级ROC-AUC
 
 - **平均精度指标**：
@@ -143,6 +144,8 @@ output_dir/
 3. 当val_loss相近时，使用accuracy_subset作为次要标准
 4. 当发现更好的参数组合时，自动更新全局最佳模型
 5. 将最佳模型保存到统一目录 `output_dir/global_best_models/`
+
+全局最佳目录下的 `*_best_metadata.json` 会记录触发该权重的参数组合、最佳指标以及对应的种子编号，方便回溯单次运行。
 
 #### 评估指标选择说明
 
