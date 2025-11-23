@@ -231,8 +231,9 @@ torchrun --nproc_per_node=8 inference_classifier.py \
 ## 自述文档
 
 - **快速查阅**：请参考 `README_MYSELF.md` 获取 inference_med 与 LoRA 微调的操作摘要、指标解读及推荐工作流。
-- **LoRA 调参提示**：README 中附带训练/结构/损失/推理多方面的微调建议（epoch、batch、rank、pos_weight、检索配置等），方便快速定位性能提升方向。
-- **LoRA 结果判定**：超参搜索统一训练 30 epoch，并比较第 10/20/30 epoch 的多种子均值表现；表现最佳的参数组合只保留一份 LoRA 权重，自动覆盖写入 `global_best_models/`。
+- **LoRA 调参提示**：README 中附带训练/结构/损失/推理多方面的微调建议（epoch、batch、rank、pos_weight、检索配置等），方便快速定位性能提升方向；新增 AUC 优化版 `train/lora/train_lora_auc.py`，可通过 `scripts/run_lora_auc.sh` 启动，默认 rank=64、dropout=0.0、lr=5e-5、batch=64、`auc_start_epoch=15`，AUC 开关/力度由 `--auc_coeff/--auc_start_epoch/--auc_gamma` 控制。
+- **LoRA 搜参（含 AUC）**：提供 `train/lora/lora_auc_search.py` 与 `scripts/run_lora_auc_search.sh`，默认在 AUC 权重/启用轮次/gamma 上做网格搜索，结果输出到 `./results/lora_auc_search/` 的配置子目录及汇总 CSV。
+- **LoRA 结果判定**：超参搜索统一训练 30 epoch，并比较第 10/20/30 epoch 的多种子均值表现；表现最佳的参数组合只保留一份 LoRA 权重，自动覆盖写入 `global_best_models/`。AUC 版的单次训练仍在 `results/lora_auc/seed_*/` 输出 best_* 权重与指标。
 
 ## 技术支持
 

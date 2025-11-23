@@ -1,0 +1,972 @@
+import os
+import sys
+import argparse
+import json
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, average_precision_score
+from sklearn.preprocessing import LabelEncoder
+from typing import Dict, List, Tuple, Optional
+import warnings
+warnings.filterwarnings('ignore')
+
+
+class ExpAUCLoss(nn.Module):
+    """
+    简化版指数 AUC surrogate，要求输入为概率（0-1）。
+    """
+
+    def __init__(self, gamma: float = 1.0):
+        super().__init__()
+        self.gamma = gamma
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred = pred.view(-1)
+        target = target.view(-1)
+
+        if pred.numel() == 0:
+            return pred.new_tensor(0.0)
+
+        # 保证输入概率范围稳定，避免极值导致梯度发散
+        pred = pred.clamp(0.0, 1.0)
+        target = target.float()
+
+        pos_mask = target >= 0.5
+        neg_mask = target < 0.5
+        num_pos = pos_mask.sum()
+        num_neg = neg_mask.sum()
+
+        if num_pos.item() == 0 or num_neg.item() == 0:
+            return pred.new_tensor(0.0)
+
+        Di = 1.0 / (num_pos.float() * num_neg.float())
+        C1 = pos_mask.float() * torch.exp(-self.gamma * pred)
+        C2 = neg_mask.float() * torch.exp(self.gamma * pred)
+        C2 = Di * C2
+        return C1.sum() * C2.sum()
+
+# Add project root to path
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+# Import lora module from current directory
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from lora import LoRAEnabledTransformer
+
+# Import other modules
+from utils.loading import load_model
+from inference.predictor import LimiXPredictor
+
+
+class MultiLabelDataset(Dataset):
+    """Dataset for multi-label classification."""
+    
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        """
+        Initialize dataset.
+        
+        Args:
+            X: Feature matrix of shape (n_samples, n_features)
+            y: Target matrix of shape (n_samples, n_labels)
+        """
+        self.X = torch.FloatTensor(X)
+        self.y = torch.FloatTensor(y)
+        
+    def __len__(self):
+        return len(self.X)
+    
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+
+class LoRATrainer:
+    """Trainer for LoRA fine-tuning of LimiX model."""
+    
+    def __init__(
+        self,
+        model_path: str,
+        target_layers: List[int] = [10, 11],
+        rank: int = 16,
+        alpha: float = None,  # 将自动设置为 rank 的两倍
+        dropout: float = 0.1,
+        learning_rate: float = 1e-4,
+        batch_size: int = 64,  # 增大默认 batch size
+        num_epochs: int = 10,
+        device: str = 'cuda',
+        run_seed: Optional[int] = None,
+        auc_coeff: float = 0.01,
+        auc_start_epoch: int = 3,
+        auc_gamma: float = 1.0
+    ):
+        """
+        Initialize LoRA trainer.
+        
+        Args:
+            model_path: Path to pre-trained LimiX model
+            target_layers: List of layer indices to apply LoRA to
+            rank: Rank of low-rank decomposition
+            alpha: Scaling factor for LoRA
+            dropout: Dropout probability
+            learning_rate: Learning rate for LoRA parameters
+            batch_size: Batch size for training
+            num_epochs: Number of training epochs
+            device: Device to use for training
+            run_seed: Seed identifier for the current run (stored in checkpoint metadata)
+            auc_coeff: Weight for AUC surrogate loss (0 关闭)
+            auc_start_epoch: Start applying AUC loss from this epoch (1-based)
+            auc_gamma: Exponential gamma for AUC surrogate
+        """
+        self.model_path = model_path
+        self.target_layers = target_layers
+        self.rank = rank
+        # alpha 自动设置为 rank 的两倍
+        self.alpha = alpha if alpha is not None else rank * 2
+        self.dropout = dropout
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+        self.num_epochs = num_epochs
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        self.run_seed = run_seed
+        self.auc_coeff = auc_coeff
+        self.auc_start_epoch = max(1, int(auc_start_epoch))
+        self.auc_loss_fn = ExpAUCLoss(gamma=auc_gamma)
+        
+        # Load base model
+        self.base_model = load_model(model_path)
+        
+        # Create LoRA-enabled model
+        self.model = LoRAEnabledTransformer(
+            base_model=self.base_model,
+            target_layers=target_layers,
+            rank=rank,
+            alpha=alpha,
+            dropout=dropout
+        ).to(self.device)
+        
+        # Setup optimizer for LoRA parameters only
+        self.optimizer = optim.AdamW(
+            self.model.get_lora_parameters(),
+            lr=learning_rate,
+            weight_decay=1e-4
+        )
+        self.test_ratio = 0.2  # portion of each mini-batch reserved as pseudo test samples
+        
+        # Loss function
+        self.criterion = nn.BCEWithLogitsLoss()
+        
+        # Metrics tracking
+        self.train_losses = []
+        self.val_losses = []
+        self.val_metrics = []
+        self.metric_trackers = {
+            'val_loss': {
+                'best': float('inf'),
+                'mode': 'min',
+                'base_name': 'best_lora',
+                'display': 'Val Loss'
+            },
+            'accuracy_subset': {
+                'best': -float('inf'),
+                'mode': 'max',
+                'base_name': 'best_accuracy_subset',
+                'display': 'Subset Accuracy'
+            },
+            'accuracy_elementwise': {
+                'best': -float('inf'),
+                'mode': 'max',
+                'base_name': 'best_accuracy_elementwise',
+                'display': 'Element-wise Accuracy'
+            },
+            'f1_macro_elementwise': {
+                'best': -float('inf'),
+                'mode': 'max',
+                'base_name': 'best_f1_macro',
+                'display': 'Macro F1'
+            },
+            'f1_micro_elementwise': {
+                'best': -float('inf'),
+                'mode': 'max',
+                'base_name': 'best_f1_micro',
+                'display': 'Micro F1'
+            },
+            'roc_auc_macro_elementwise': {
+                'best': -float('inf'),
+                'mode': 'max',
+                'base_name': 'best_roc_auc_macro',
+                'display': 'Macro ROC-AUC'
+            },
+            'roc_auc_micro_elementwise': {
+                'best': -float('inf'),
+                'mode': 'max',
+                'base_name': 'best_roc_auc_micro',
+                'display': 'Micro ROC-AUC'
+            }
+        }
+    
+    def load_data(self, file_path: str, target_cols: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Load and preprocess data.
+        
+        Args:
+            file_path: Path to Excel file
+            target_cols: List of target column names
+            
+        Returns:
+            X: Feature matrix
+            y: Target matrix
+        """
+        print(f"Loading data from {file_path}")
+        df = pd.read_excel(file_path)
+        
+        # Extract features and targets
+        X = df.drop(columns=target_cols).values
+        y = df[target_cols].values.astype(np.float32)
+        
+        print(f"Data shape - Features: {X.shape}, Targets: {y.shape}")
+        return X, y
+    
+    def prepare_data(
+        self, 
+        X: np.ndarray, 
+        y: np.ndarray, 
+        test_size: float = 0.2,
+        random_state: int = 42
+    ) -> Tuple[DataLoader, DataLoader]:
+        """
+        Prepare train and validation data loaders.
+        
+        Args:
+            X: Feature matrix
+            y: Target matrix
+            test_size: Proportion of data for validation
+            random_state: Random seed for splitting
+            
+        Returns:
+            train_loader: Training data loader
+            val_loader: Validation data loader
+        """
+        # Split data
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=test_size, random_state=random_state
+        )
+        
+        # Create datasets
+        train_dataset = MultiLabelDataset(X_train, y_train)
+        val_dataset = MultiLabelDataset(X_val, y_val)
+        
+        # Create data loaders
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=self.batch_size, 
+            shuffle=True
+        )
+        val_loader = DataLoader(
+            val_dataset, 
+            batch_size=self.batch_size, 
+            shuffle=False
+        )
+        
+        return train_loader, val_loader
+    
+    def train_epoch(self, train_loader: DataLoader, epoch_idx: int = 0) -> float:
+        """
+        Train for one epoch.
+        
+        Args:
+            train_loader: Training data loader
+            epoch_idx: Current epoch index (0-based)
+            
+        Returns:
+            Average training loss
+        """
+        self.model.train()
+        total_loss = 0.0
+        
+        for batch_idx, (X_batch, y_batch) in enumerate(train_loader):
+            X_batch = X_batch.to(self.device)
+            y_batch = y_batch.to(self.device)
+            
+            # Forward pass
+            self.optimizer.zero_grad()
+            
+            # Prepare data for LimiX model
+            # LimiX expects x: [batch, seq, feature] and y: [batch, label]
+            # For multi-label, we need to handle each label separately
+            batch_size = X_batch.size(0)
+            n_features = X_batch.size(1)
+            n_labels = y_batch.size(1)
+            
+            # For simplicity, we'll use a simplified approach
+            # In practice, you might need to adapt this based on the exact LimiX interface
+            total_batch_loss = 0.0
+            valid_forward_passes = 0
+            
+            for label_idx in range(n_labels):
+                # Prepare data for single label
+                y_single = y_batch[:, label_idx:label_idx+1]
+                
+                # Create sequence dimension (LimiX expects sequence dimension)
+                # Based on the original predictor code, x should be [1, batch, features] and y should be [1, batch]
+                X_seq = X_batch.unsqueeze(0)  # [1, batch, features]
+                y_for_model = y_single.squeeze(-1).unsqueeze(0)  # [1, batch]
+                
+                # Split batch into pseudo train/test segments so the transformer receives both
+                eval_pos = max(1, int((1 - self.test_ratio) * X_seq.shape[1]))
+                eval_pos = min(eval_pos, X_seq.shape[1] - 1)
+                test_len = X_seq.shape[1] - eval_pos
+                if test_len <= 0:
+                    continue
+                
+                try:
+                    # Forward pass through model with mixed precision
+                    with torch.cuda.amp.autocast():
+                        output = self.model(
+                            x=X_seq,
+                            y=y_for_model,
+                            eval_pos=eval_pos,
+                            task_type='cls'
+                        )
+                    
+                    # Extract classification output
+                    if isinstance(output, dict):
+                        cls_output = output.get('cls_output', output)
+                    else:
+                        cls_output = output
+                    
+                    # Debug print to understand shapes
+                    if label_idx == 0 and batch_idx == 0:
+                        print(f"Debug - X_seq shape: {X_seq.shape}")
+                        print(f"Debug - y_for_model shape: {y_for_model.shape}")
+                        print(f"Debug - output type: {type(output)}")
+                        if isinstance(output, dict):
+                            print(f"Debug - output keys: {output.keys()}")
+                        print(f"Debug - cls_output shape: {cls_output.shape}")
+                        print(f"Debug - y_target shape: {y_for_model.squeeze(0).shape}")
+                    
+                    # Calculate loss
+                    if cls_output.dim() > 2:
+                        cls_output = cls_output.squeeze(0)
+                    
+                    # Retain only the logits for the pseudo test portion
+                    cls_output = cls_output[:test_len]
+                    y_target = y_for_model[:, eval_pos:eval_pos + test_len].squeeze(0)
+                    
+                    # Ensure shapes match
+                    min_len = min(cls_output.shape[0], y_target.shape[0])
+                    cls_output = cls_output[:min_len]
+                    y_target = y_target[:min_len]
+                    
+                    # Ensure target is float for BCEWithLogitsLoss
+                    y_target = y_target.float()
+                    
+                    # Collapse logits to the positive class for binary targets
+                    if cls_output.shape[-1] >= 2:
+                        logits = cls_output[:, 1].float()
+                    else:
+                        logits = cls_output.squeeze(-1).float()
+                    
+                    base_loss = self.criterion(logits, y_target)
+                    combined_loss = base_loss
+
+                    # AUC surrogate (开启后在指定 epoch 之后叠加)
+                    use_auc_loss = self.auc_coeff > 0 and (epoch_idx + 1) >= self.auc_start_epoch
+                    if use_auc_loss:
+                        probs = torch.sigmoid(logits).clamp(1e-6, 1 - 1e-6)
+                        auc_loss = self.auc_loss_fn(probs, y_target)
+                        if torch.isfinite(auc_loss):
+                            combined_loss = combined_loss + self.auc_coeff * auc_loss
+
+                    # Scale loss by number of labels to maintain similar magnitude
+                    scaled_loss = combined_loss / n_labels
+                    
+                    # Backward pass
+                    scaled_loss.backward()
+                    total_batch_loss += combined_loss.item()
+                    valid_forward_passes += 1
+                    
+                except Exception as e:
+                    print(f"Error in forward pass for label {label_idx}: {e}")
+                    continue
+            
+            # Update weights with mixed precision - only if we had valid forward passes
+            if valid_forward_passes > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+            
+            total_loss += total_batch_loss / n_labels
+            
+            if batch_idx % 10 == 0:
+                print(f"Batch {batch_idx}/{len(train_loader)}, Loss: {total_batch_loss / n_labels:.4f}")
+        
+        return total_loss / len(train_loader)
+    
+    def evaluate(self, val_loader: DataLoader) -> Tuple[float, Dict[str, float]]:
+        """
+        Evaluate the model.
+        
+        Args:
+            val_loader: Validation data loader
+            
+        Returns:
+            Average validation loss and metrics
+        """
+        self.model.eval()
+        total_loss = 0.0
+        all_predictions = []
+        all_targets = []
+        
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch = X_batch.to(self.device)
+                y_batch = y_batch.to(self.device)
+                
+                batch_size = X_batch.size(0)
+                n_labels = y_batch.size(1)
+                
+                batch_predictions = []
+                batch_targets = []
+                batch_loss = 0.0
+                
+                for label_idx in range(n_labels):
+                    # Prepare data for single label
+                    y_single = y_batch[:, label_idx:label_idx+1]
+                    
+                    # Create sequence dimension
+                    # Based on the original predictor code, x should be [1, batch, features] and y should be [1, batch]
+                    X_seq = X_batch.unsqueeze(0)  # [1, batch, features]
+                    y_for_model = y_single.squeeze(-1).unsqueeze(0)  # [1, batch]
+                    
+                    try:
+                        eval_pos = max(1, min(int((1 - self.test_ratio) * X_seq.shape[1]), X_seq.shape[1] - 1))
+                        with torch.cuda.amp.autocast():
+                            output = self.model(
+                                x=X_seq,
+                                y=y_for_model,
+                                eval_pos=eval_pos,
+                                task_type='cls'
+                            )
+                        test_len = X_seq.shape[1] - eval_pos
+                        if test_len <= 0:
+                            continue
+                            
+                        # Extract classification output
+                        if isinstance(output, dict):
+                            cls_output = output.get('cls_output', output)
+                        else:
+                            cls_output = output
+                        
+                        if cls_output.dim() > 2:
+                            cls_output = cls_output.squeeze(0)
+                        
+                        cls_output = cls_output[:test_len]
+                        
+                        # Get the target labels
+                        y_target = y_for_model[:, eval_pos:eval_pos + test_len].squeeze(0)  # [test_len]
+                        
+                        # Convert target to float for BCEWithLogitsLoss
+                        y_target = y_target.float()
+                        
+                        min_len = min(cls_output.shape[0], y_target.shape[0])
+                        cls_output = cls_output[:min_len]
+                        y_target = y_target[:min_len]
+                        
+                        if cls_output.shape[-1] >= 2:
+                            logits = cls_output[:, 1].float()
+                            pred = torch.softmax(cls_output[:, :2].float(), dim=1)[:, 1].detach().cpu().numpy()
+                        else:
+                            logits = cls_output.squeeze(-1).float()
+                            pred = torch.sigmoid(logits).detach().cpu().numpy()
+                        
+                        loss = self.criterion(logits, y_target)
+                        batch_loss += loss.item()
+                        batch_predictions.append(pred)
+                        batch_targets.append(y_target.detach().cpu().numpy())
+                        
+                    except Exception as e:
+                        print(f"Error in evaluation for label {label_idx}: {e}")
+                        # Use dummy predictions
+                        batch_predictions.append(np.zeros(eval_pos if 'eval_pos' in locals() else batch_size))
+                        batch_targets.append(np.zeros(eval_pos if 'eval_pos' in locals() else batch_size))
+                        continue
+                
+                total_loss += batch_loss / n_labels
+                
+                # Combine predictions for all labels
+                if batch_predictions:
+                    min_pred_len = min(len(arr) for arr in batch_predictions)
+                    preds = np.stack([arr[:min_pred_len] for arr in batch_predictions], axis=1)
+                    targs = np.stack([arr[:min_pred_len] for arr in batch_targets], axis=1)
+                    all_predictions.append(preds)
+                    all_targets.append(targs)
+        
+        # Calculate metrics
+        avg_loss = total_loss / len(val_loader)
+        
+        if all_predictions and all_targets:
+            all_predictions = np.vstack(all_predictions)
+            all_targets = np.vstack(all_targets)
+            
+            # Convert predictions to binary
+            binary_predictions = (all_predictions >= 0.5).astype(int)
+            
+            # Calculate metrics for element-wise (per-label) and subset/sample perspectives
+            subset_accuracy = accuracy_score(all_targets, binary_predictions)
+            elementwise_accuracy = float((binary_predictions == all_targets).mean())
+
+            def safe_metric(func, *args, default=np.nan, **kwargs):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as err:
+                    print(f"{func.__name__}计算失败: {err}")
+                    return default
+
+            precision_macro = safe_metric(
+                precision_score, all_targets, binary_predictions, average='macro', zero_division=0
+            )
+            precision_samples = safe_metric(
+                precision_score, all_targets, binary_predictions, average='samples', zero_division=0
+            )
+            recall_macro = safe_metric(
+                recall_score, all_targets, binary_predictions, average='macro', zero_division=0
+            )
+            recall_samples = safe_metric(
+                recall_score, all_targets, binary_predictions, average='samples', zero_division=0
+            )
+            f1_macro = safe_metric(
+                f1_score, all_targets, binary_predictions, average='macro', zero_division=0
+            )
+            f1_micro = safe_metric(
+                f1_score, all_targets, binary_predictions, average='micro', zero_division=0
+            )
+            f1_samples = safe_metric(
+                f1_score, all_targets, binary_predictions, average='samples', zero_division=0
+            )
+            roc_auc_macro = safe_metric(
+                roc_auc_score, all_targets, all_predictions, average='macro'
+            )
+            roc_auc_micro = safe_metric(
+                roc_auc_score, all_targets, all_predictions, average='micro'
+            )
+            roc_auc_samples = safe_metric(
+                roc_auc_score, all_targets, all_predictions, average='samples'
+            )
+            avg_precision_macro = safe_metric(
+                average_precision_score, all_targets, all_predictions, average='macro'
+            )
+            avg_precision_samples = safe_metric(
+                average_precision_score, all_targets, all_predictions, average='samples'
+            )
+
+            metrics = {
+                'accuracy_subset': subset_accuracy,
+                'accuracy_elementwise': elementwise_accuracy,
+                'precision_macro_elementwise': precision_macro,
+                'precision_samples_subset': precision_samples,
+                'recall_macro_elementwise': recall_macro,
+                'recall_samples_subset': recall_samples,
+                'f1_macro_elementwise': f1_macro,
+                'f1_micro_elementwise': f1_micro,
+                'f1_samples_subset': f1_samples,
+                'roc_auc_macro_elementwise': roc_auc_macro,
+                'roc_auc_micro_elementwise': roc_auc_micro,
+                'roc_auc_samples_subset': roc_auc_samples,
+                'avg_precision_macro_elementwise': avg_precision_macro,
+                'avg_precision_samples_subset': avg_precision_samples
+            }
+            metrics.update({
+                'f1_macro': f1_macro,
+                'f1_micro': f1_micro,
+                'roc_auc_macro': roc_auc_macro,
+                'roc_auc_micro': roc_auc_micro
+            })
+        else:
+            metrics = {
+                'accuracy_subset': 0.0,
+                'accuracy_elementwise': 0.0,
+                'precision_macro_elementwise': 0.0,
+                'precision_samples_subset': 0.0,
+                'recall_macro_elementwise': 0.0,
+                'recall_samples_subset': 0.0,
+                'f1_macro_elementwise': 0.0,
+                'f1_micro_elementwise': 0.0,
+                'f1_samples_subset': 0.0,
+                'roc_auc_macro_elementwise': 0.0,
+                'roc_auc_micro_elementwise': 0.0,
+                'roc_auc_samples_subset': 0.0,
+                'avg_precision_macro_elementwise': 0.0,
+                'avg_precision_samples_subset': 0.0
+            }
+            metrics.update({
+                'f1_macro': 0.0,
+                'f1_micro': 0.0,
+                'roc_auc_macro': 0.0,
+                'roc_auc_micro': 0.0
+            })
+        
+        return avg_loss, metrics
+
+    def _is_finite_number(self, value) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, (float, int, np.floating, np.integer)):
+            return np.isfinite(value)
+        return False
+
+    def _update_best_models(
+        self,
+        save_dir: str,
+        epoch_idx: int,
+        val_loss: float,
+        val_metrics: Dict[str, float]
+    ):
+        metrics_to_check = {'val_loss': val_loss}
+        metrics_to_check.update({
+            'accuracy_subset': val_metrics.get('accuracy_subset'),
+            'accuracy_elementwise': val_metrics.get('accuracy_elementwise'),
+            'f1_macro_elementwise': val_metrics.get('f1_macro_elementwise'),
+            'f1_micro_elementwise': val_metrics.get('f1_micro_elementwise'),
+            'roc_auc_macro_elementwise': val_metrics.get('roc_auc_macro_elementwise'),
+            'roc_auc_micro_elementwise': val_metrics.get('roc_auc_micro_elementwise'),
+        })
+
+        for metric_key, current_value in metrics_to_check.items():
+            tracker = self.metric_trackers.get(metric_key)
+            if tracker is None or not self._is_finite_number(current_value):
+                continue
+
+            better = (
+                current_value < tracker['best']
+                if tracker['mode'] == 'min'
+                else current_value > tracker['best']
+            )
+            if not better:
+                continue
+
+            tracker['best'] = float(current_value)
+            base_name = tracker['base_name']
+            metric_label = tracker['display']
+
+            if metric_key == 'val_loss':
+                model_path = os.path.join(save_dir, f'{base_name}_model.pth')
+                weights_path = os.path.join(save_dir, f'{base_name}_weights.pth')
+                self.save_checkpoint(model_path, epoch_idx, val_loss, val_metrics)
+                self.model.save_lora_weights(weights_path)
+                meta_path = os.path.join(save_dir, f'{base_name}_metrics.json')
+            else:
+                model_path = None
+                weights_path = os.path.join(save_dir, f'{base_name}_weights.pth')
+                meta_path = os.path.join(save_dir, f'{base_name}_metrics.json')
+                self.model.save_lora_weights(weights_path)
+            val_loss_value = float(val_loss) if self._is_finite_number(val_loss) else None
+            metrics_snapshot = {}
+            for key, value in val_metrics.items():
+                if self._is_finite_number(value):
+                    metrics_snapshot[key] = float(value)
+                else:
+                    metrics_snapshot[key] = None
+            metadata = {
+                'metric_key': metric_key,
+                'metric_display': metric_label,
+                'metric_value': float(current_value),
+                'epoch': int(epoch_idx + 1),
+                'val_loss_at_save': val_loss_value,
+                'seed': int(self.run_seed) if self.run_seed is not None else None,
+                'checkpoint_path': model_path if metric_key == 'val_loss' else None,
+                'weights_path': weights_path,
+                'val_metrics': metrics_snapshot
+            }
+            with open(meta_path, 'w', encoding='utf-8') as meta_file:
+                json.dump(metadata, meta_file, ensure_ascii=False, indent=2)
+            print(f"Saved new best {metric_label} ({current_value:.4f}) at epoch {epoch_idx + 1} -> {weights_path}")
+    
+    def train(
+        self, 
+        train_loader: DataLoader, 
+        val_loader: DataLoader,
+        save_dir: str = './checkpoints'
+    ):
+        """
+        Train the model.
+        
+        Args:
+            train_loader: Training data loader
+            val_loader: Validation data loader
+            save_dir: Directory to save checkpoints
+        """
+        os.makedirs(save_dir, exist_ok=True)
+        
+        for epoch in range(self.num_epochs):
+            print(f"\nEpoch {epoch+1}/{self.num_epochs}")
+            print("-" * 50)
+            
+            # Training
+            train_loss = self.train_epoch(train_loader, epoch_idx=epoch)
+            self.train_losses.append(train_loss)
+            
+            # Validation
+            val_loss, val_metrics = self.evaluate(val_loader)
+            self.val_losses.append(val_loss)
+            self.val_metrics.append(val_metrics)
+            
+            print(f"Train Loss: {train_loss:.4f}")
+            print(f"Val Loss: {val_loss:.4f}")
+            if 'accuracy_subset' in val_metrics:
+                print(f"Val Accuracy (subset): {val_metrics['accuracy_subset']:.4f}")
+            if 'accuracy_elementwise' in val_metrics:
+                print(f"Val Accuracy (element-wise): {val_metrics['accuracy_elementwise']:.4f}")
+            print(f"Val Metrics: {val_metrics}")
+            
+            # Save checkpoints for improved metrics
+            self._update_best_models(save_dir, epoch, val_loss, val_metrics)
+            
+            # Save regular checkpoint
+            if (epoch + 1) % 5 == 0:
+                checkpoint_path = os.path.join(save_dir, f'lora_epoch_{epoch+1}.pth')
+                self.save_checkpoint(checkpoint_path, epoch, val_loss, val_metrics)
+    
+    def save_checkpoint(
+        self, 
+        path: str, 
+        epoch: int, 
+        val_loss: float, 
+        val_metrics: Dict[str, float]
+    ):
+        """
+        Save model checkpoint.
+        
+        Args:
+            path: Path to save checkpoint
+            epoch: Current epoch
+            val_loss: Validation loss
+            val_metrics: Validation metrics
+        """
+        checkpoint = {
+            'epoch': epoch,
+            'val_loss': val_loss,
+            'val_metrics': val_metrics,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'config': {
+                'target_layers': self.target_layers,
+                'rank': self.rank,
+                'alpha': self.alpha,
+                'dropout': self.dropout,
+                'learning_rate': self.learning_rate,
+                'auc_coeff': self.auc_coeff,
+                'auc_start_epoch': self.auc_start_epoch,
+                'auc_gamma': getattr(self.auc_loss_fn, 'gamma', None)
+            }
+        }
+        torch.save(checkpoint, path)
+    
+    def save_lora_weights(self, path: str):
+        """
+        Save only LoRA weights.
+        
+        Args:
+            path: Path to save LoRA weights
+        """
+        self.model.save_lora_weights(path)
+        print(f"LoRA weights saved to {path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='LoRA fine-tuning for LimiX model')
+    parser.add_argument('--model_path', type=str, 
+                       default="/home/ruochen/models/limix/LimiX-16M.ckpt",
+                       help='Path to pre-trained LimiX model')
+    parser.add_argument('--data_path', type=str,
+                       default="/home/ruochen/data/medtable_术前特征_processed-多变量预测.xlsx",
+                       help='Path to training data')
+    parser.add_argument('--target_cols', nargs='+', type=str,
+                       default=["脑脊液漏", "神经功能加重", "严重并发症（死亡＋瘫痪＋再手术＋再入院）"],
+                       help='Target column names')
+    parser.add_argument('--seeds', nargs='+', type=int,
+                       default=[10, 20, 30, 40, 50],
+                       help='Random seeds for experiments')
+    parser.add_argument('--rank', type=int, default=16,
+                       help='Rank for LoRA decomposition')
+    parser.add_argument('--alpha', type=float, default=32.0,
+                       help='Scaling factor for LoRA')
+    parser.add_argument('--dropout', type=float, default=0.1,
+                       help='Dropout probability')
+    parser.add_argument('--learning_rate', type=float, default=1e-4,
+                       help='Learning rate')
+    parser.add_argument('--batch_size', type=int, default=32,
+                       help='Batch size')
+    parser.add_argument('--num_epochs', type=int, default=10,
+                       help='Number of training epochs')
+    parser.add_argument('--device', type=str, default='cuda',
+                       help='Device to use')
+    parser.add_argument('--output_dir', type=str, default='./results/lora_auc',
+                       help='Output directory for results')
+    parser.add_argument('--auc_coeff', type=float, default=0.01,
+                       help='Weight for AUC surrogate loss (0 to disable)')
+    parser.add_argument('--auc_start_epoch', type=int, default=15,
+                       help='Epoch (1-based) to start applying AUC loss')
+    parser.add_argument('--auc_gamma', type=float, default=1.0,
+                       help='Gamma for exponential AUC loss')
+    
+    args = parser.parse_args()
+    
+    print("LoRA Fine-tuning for LimiX Model")
+    print("=" * 50)
+    print(f"Model path: {args.model_path}")
+    print(f"Data path: {args.data_path}")
+    print(f"Target columns: {args.target_cols}")
+    print(f"Random seeds: {args.seeds}")
+    print(f"LoRA rank: {args.rank}")
+    print(f"LoRA alpha: {args.alpha}")
+    print(f"AUC coeff: {args.auc_coeff}, start epoch: {args.auc_start_epoch}, gamma: {args.auc_gamma}")
+    print("=" * 50)
+    
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Load data
+    X, y = load_and_preprocess_data(args.data_path, args.target_cols)
+    
+    # Run experiments for each seed
+    all_results = []
+    
+    for seed in args.seeds:
+        print(f"\n{'='*60}")
+        print(f"Running experiment with seed {seed}")
+        print(f"{'='*60}")
+        
+        # Create trainer
+        trainer = LoRATrainer(
+            model_path=args.model_path,
+            target_layers=[10, 11],  # Last two layers
+            rank=args.rank,
+            alpha=args.alpha,
+            dropout=args.dropout,
+            learning_rate=args.learning_rate,
+            batch_size=args.batch_size,
+            num_epochs=args.num_epochs,
+            device=args.device,
+            run_seed=seed,
+            auc_coeff=args.auc_coeff,
+            auc_start_epoch=args.auc_start_epoch,
+            auc_gamma=args.auc_gamma
+        )
+        
+        # Prepare data
+        train_loader, val_loader = trainer.prepare_data(
+            X, y, test_size=0.2, random_state=seed
+        )
+        
+        # Create seed-specific output directory
+        seed_output_dir = os.path.join(args.output_dir, f'seed_{seed}')
+        os.makedirs(seed_output_dir, exist_ok=True)
+        
+        # Train model
+        trainer.train(train_loader, val_loader, save_dir=seed_output_dir)
+        
+        # Save LoRA weights
+        lora_path = os.path.join(seed_output_dir, 'lora_weights.pth')
+        trainer.save_lora_weights(lora_path)
+        
+        # Get final metrics
+        if trainer.val_metrics:
+            final_metrics = trainer.val_metrics[-1]
+            final_metrics['seed'] = seed
+            all_results.append(final_metrics)
+            
+            # Save results
+            results_df = pd.DataFrame([final_metrics])
+            results_path = os.path.join(seed_output_dir, 'results.csv')
+            results_df.to_csv(results_path, index=False)
+            
+            print(f"Results for seed {seed}: {final_metrics}")
+    
+    # Save all results using format similar to multi_label_inference.py
+    if all_results:
+        all_results_df = pd.DataFrame(all_results)
+        
+        # 将目标列名组合成文件名
+        target_name = "_".join(args.target_cols)
+        output_path = os.path.join(args.output_dir, f'{target_name}_results.csv')
+        summary_path = os.path.join(args.output_dir, f'{target_name}_summary.csv')
+        
+        # 确保目录存在
+        os.makedirs(args.output_dir, exist_ok=True)
+        
+        # 保存详细结果
+        all_results_df.to_csv(output_path, index=False)
+        print(f"\n详细结果已保存至 {output_path}")
+        
+        # 计算平均值和标准差
+        print("\n性能指标汇总 (mean ± std):")
+        numeric_cols = all_results_df.select_dtypes(include=[np.number]).columns
+        summary = all_results_df[numeric_cols].agg(['mean', 'std']).round(4)
+        
+        for col in numeric_cols:
+            if col != 'seed':
+                mean_val = summary.loc['mean', col]
+                std_val = summary.loc['std', col]
+                mean_display = 0.0 if pd.isna(mean_val) else float(mean_val)
+                std_display = 0.0 if pd.isna(std_val) else float(std_val)
+                print(f"{col}: {mean_display:.4f}±{std_display:.4f}")
+        
+        # 保存均值结果 - 修改为保存多个种子的指标平均值和标准差
+        # 创建包含平均值和标准差的DataFrame
+        summary_data = {}
+        for col in numeric_cols:
+            if col != 'seed':
+                mean_val = summary.loc['mean', col]
+                std_val = summary.loc['std', col]
+                mean_display = 0.0 if pd.isna(mean_val) else float(mean_val)
+                std_display = 0.0 if pd.isna(std_val) else float(std_val)
+                summary_data[col] = [f"{mean_display:.4f}±{std_display:.4f}"]
+        
+        # 添加种子数量信息
+        summary_data['num_seeds'] = [len(all_results)]
+        
+        # 创建summary DataFrame
+        summary_df = pd.DataFrame(summary_data)
+        
+        # 重新排列列顺序，将num_seeds放在第一列，然后按指标分组
+        cols = ['num_seeds'] + [col for col in numeric_cols if col != 'seed']
+        summary_df = summary_df[cols]
+        
+        summary_df.to_csv(summary_path, index=False)
+        print(f"均值结果已保存至 {summary_path}")
+        print(f"注意：summary文件现在保存的是多个种子的指标平均值和标准差，而不是最高值")
+    
+    print("\nLoRA fine-tuning completed!")
+
+
+def load_and_preprocess_data(file_path: str, target_cols: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load and preprocess data.
+    
+    Args:
+        file_path: Path to Excel file
+        target_cols: List of target column names
+        
+    Returns:
+        X: Feature matrix
+        y: Target matrix
+    """
+    df = pd.read_excel(file_path)
+    
+    # Extract features and targets
+    X = df.drop(columns=target_cols).values
+    y = df[target_cols].values.astype(np.float32)
+    
+    # Handle missing values
+    X = np.nan_to_num(X, nan=0.0)
+    y = np.nan_to_num(y, nan=0.0)
+    
+    return X, y
+
+
+if __name__ == "__main__":
+    main()

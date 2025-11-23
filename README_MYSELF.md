@@ -15,10 +15,11 @@
 - **常见使用场景**：医疗并发症预测、多随机种子稳定性评估、与 LoRA 微调结果对比。
 
 ## train/lora 模块
-- **目标**：对 LimiX 模型进行轻量 LoRA 微调，使其适配特定医疗任务。
-- **核心脚本**：`train_lora.py` 定义单次训练流程，`run_lora_finetuning.py` 统一处理多种子实验，`lora_hyperparameter_search.py` 负责多参数组合搜索并自动比较不同 epoch。
-- **指标输出**：超参搜索只为每组参数生成一份轻量目录 `results/lora_hyperparameter_search/combo_*/`，其中 `epoch_summary.csv` 记录 10/20/30 epoch 的多种子均值与方差；全局最佳的 LoRA 权重会覆盖式地写入 `results/lora_hyperparameter_search/global_best_models/`。
-- **检查点输出**：单次训练会自动在 `best_lora_*` 系列文件中记录验证集表现最优的权重：`best_lora` 对应最优 val loss（含完整 checkpoint 与 LoRA-only 权重），`best_accuracy_subset` / `best_accuracy_elementwise`、`best_f1_macro`、`best_f1_micro`、`best_roc_auc_macro`、`best_roc_auc_micro` 会额外输出 LoRA 权重及对应的 `*_metrics.json` 说明文件（含触发 epoch、seed、当时的验证指标），方便按需挑选。
+- **目标**：对 LimiX 模型进行轻量 LoRA 微调，使其适配特定医疗任务；新增 AUC surrogate 版，强化 ROC-AUC 排序表现。
+- **核心脚本**：`train_lora.py`（基础版单次训练），`train_lora_auc.py`（带 AUC loss，可用 `--auc_coeff/--auc_start_epoch/--auc_gamma` 控制），`run_lora_finetuning.py`（多种子实验），`lora_hyperparameter_search.py`（基础版超参搜索，统一比较 10/20/30 epoch），`lora_auc_search.py`（专注 AUC 相关超参的简易网格搜索）。
+- **便捷脚本**：`scripts/run_lora_auc.sh`（默认 rank=64、alpha=128、dropout=0.0、lr=5e-5、batch=64、auc_start_epoch=15；通过环境变量覆盖参数），`scripts/run_lora_auc_search.sh`（默认搜索 AUC 权重/启用轮次/gamma，输出到 `./results/lora_auc_search/`）。
+- **指标输出**：超参搜索只为每组参数生成一份轻量目录 `results/lora_hyperparameter_search/combo_*/`，其中 `epoch_summary.csv` 记录 10/20/30 epoch 的多种子均值与方差；全局最佳的 LoRA 权重会覆盖式地写入 `results/lora_hyperparameter_search/global_best_models/`。AUC 版单次训练的 best_* 权重与指标保存在 `results/lora_auc/seed_*/`。
+- **检查点输出**：单次训练会自动在 `best_lora_*` 系列文件中记录验证集表现最优的权重：`best_lora` 对应最优 val loss（含完整 checkpoint 与 LoRA-only 权重），`best_accuracy_subset` / `best_accuracy_elementwise`、`best_f1_macro`、`best_f1_micro`、`best_roc_auc_macro`、`best_roc_auc_micro` 会额外输出 LoRA 权重及对应的 `*_metrics.json` 说明文件（含触发 epoch、seed、当时的验证指标），方便按需挑选；AUC 版同理，额外可通过 AUC 参数权衡排序与 BCE。
 - **评估策略**：每个参数组合仅训练一次 30 epoch，同时缓存第 10/20/30 epoch；对这些 epoch 先做跨种子平均，再以验证集 loss（并在需要时用 subset accuracy 打破平手）挑出最终成绩和需保留的权重。
 - **GPU 与性能注意**：虽只训练 LoRA 权重，但仍需完整前向；建议使用较大的 batch、开启 CUDA 混合精度以提升吞吐。
 - **运行示例**：
