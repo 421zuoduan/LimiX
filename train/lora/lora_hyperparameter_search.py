@@ -177,12 +177,6 @@ class LoRATrainer:
                 'base_name': 'best_roc_auc_micro',
                 'display': 'Micro ROC-AUC'
             },
-            'roc_auc_samples': {
-                'best': -float('inf'),
-                'mode': 'max',
-                'base_name': 'best_roc_auc_samples',
-                'display': 'Samples ROC-AUC'
-            }
         }
     
     def prepare_data(
@@ -458,9 +452,6 @@ class LoRATrainer:
             roc_auc_micro = safe_metric(
                 roc_auc_score, all_targets, all_predictions, average='micro'
             )
-            roc_auc_samples = safe_metric(
-                roc_auc_score, all_targets, all_predictions, average='samples'
-            )
             
             # F1 Score (使用0.5阈值)
             f1_macro = safe_metric(
@@ -487,7 +478,6 @@ class LoRATrainer:
                 'f1_samples': f1_samples,
                 'roc_auc_macro': roc_auc_macro,
                 'roc_auc_micro': roc_auc_micro,
-                'roc_auc_samples': roc_auc_samples
             }
         else:
             metrics = {
@@ -499,7 +489,6 @@ class LoRATrainer:
                 'f1_samples': 0.0,
                 'roc_auc_macro': 0.0,
                 'roc_auc_micro': 0.0,
-                'roc_auc_samples': 0.0
             }
         
         return avg_loss, metrics
@@ -531,7 +520,6 @@ class LoRATrainer:
             'f1_samples': val_metrics.get('f1_samples'),
             'roc_auc_macro': val_metrics.get('roc_auc_macro'),
             'roc_auc_micro': val_metrics.get('roc_auc_micro'),
-            'roc_auc_samples': val_metrics.get('roc_auc_samples'),
         })
 
         for metric_key, current_value in metrics_to_check.items():
@@ -1117,7 +1105,6 @@ def run_hyperparameter_search(
                 print(f"F1 Score (Samples): {best_epoch_metrics.get('f1_samples_mean', 0):.4f}")
                 print(f"ROC AUC (Macro): {best_epoch_metrics.get('roc_auc_macro_mean', 0):.4f}")
                 print(f"ROC AUC (Micro): {best_epoch_metrics.get('roc_auc_micro_mean', 0):.4f}")
-                print(f"ROC AUC (Samples): {best_epoch_metrics.get('roc_auc_samples_mean', 0):.4f}")
         else:
             print(f"Warning: no LoRA weights captured for best epoch {best_epoch} in combination {i+1}.")
         
@@ -1176,7 +1163,6 @@ def run_hyperparameter_search(
         best_roc_auc_micro = None
         if 'roc_auc_micro_mean' in all_results_df.columns:
             best_roc_auc_micro = all_results_df.loc[all_results_df['roc_auc_micro_mean'].idxmax()]
-        best_roc_auc_samples = all_results_df.loc[all_results_df['roc_auc_samples_mean'].idxmax()]
         
         print("\n" + "="*80)
         print("最佳参数组合")
@@ -1213,9 +1199,6 @@ def run_hyperparameter_search(
             print(f"  参数: {dict([(k, best_roc_auc_micro[k]) for k in param_names if k in best_roc_auc_micro])}")
             print(f"  ROC AUC Micro: {best_roc_auc_micro['roc_auc_micro_mean']:.4f} ± {best_roc_auc_micro['roc_auc_micro_std']:.4f}")
         
-        print(f"\n基于最佳 ROC AUC Samples:")
-        print(f"  参数: {dict([(k, best_roc_auc_samples[k]) for k in param_names if k in best_roc_auc_samples])}")
-        print(f"  ROC AUC Samples: {best_roc_auc_samples['roc_auc_samples_mean']:.4f} ± {best_roc_auc_samples['roc_auc_samples_std']:.4f}")
         
         # Save best parameters
         best_params_path = os.path.join(output_dir, f'{target_name}_best_parameters.json')
@@ -1226,7 +1209,6 @@ def run_hyperparameter_search(
             'best_f1_macro': dict([(k, best_f1_macro[k]) for k in param_names + ['f1_macro_mean', 'f1_macro_std'] if k in best_f1_macro]),
             'best_f1_samples': dict([(k, best_f1_samples[k]) for k in param_names + ['f1_samples_mean', 'f1_samples_std'] if k in best_f1_samples]),
             'best_roc_auc': dict([(k, best_roc_auc[k]) for k in param_names + ['roc_auc_macro_mean', 'roc_auc_macro_std'] if k in best_roc_auc]),
-            'best_roc_auc_samples': dict([(k, best_roc_auc_samples[k]) for k in param_names + ['roc_auc_samples_mean', 'roc_auc_samples_std'] if k in best_roc_auc_samples])
         }
         if best_f1_micro is not None:
             best_params['best_f1_micro'] = dict([(k, best_f1_micro[k]) for k in param_names + ['f1_micro_mean', 'f1_micro_std'] if k in best_f1_micro])
