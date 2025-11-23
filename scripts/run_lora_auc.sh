@@ -21,8 +21,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 : "${EPOCHS:=30}"
 : "${DEVICE:=cuda}"
 
-: "${AUC_COEFF:=0.01}"
-: "${AUC_START:=20}"
+: "${AUC_COEFF:=0.001}"
+: "${AUC_START:=15}"
 : "${AUC_GAMMA:=1.0}"
 
 mkdir -p "$OUTPUT_DIR"
