@@ -19,9 +19,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 : "${VAL_RATIO:=0.2}"
 
 : "${AUC_COEFFS:=0.005,0.01,0.02}"
-: "${AUC_STARTS:=10,15,20}"
+: "${AUC_STARTS:=25}"
 : "${AUC_GAMMAS:=1.0}"
-: "${LRS:=1e-5,5e-05,1e-04}"
+: "${LRS:=1e-5,1e-04}"
 
 cd "$ROOT"
 
